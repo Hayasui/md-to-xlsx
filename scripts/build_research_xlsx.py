@@ -4,20 +4,27 @@
 
 表分三类，每类可放任意多个实例（含 0 个）：
 
-    needs   需求梳理        纯中文
-    survey  玩家筛选问卷    中英逐行并列
-    outline 访谈大纲        中英逐行并列，可选加「追问方向 / 观察记录点」两列
+    needs      需求梳理      纯中文
+    survey     问卷（中英）  中英逐行并列，含「问卷逻辑」列
+    survey_cn  问卷（纯中文）纯中文，含「问卷逻辑」列
+    outline    访谈大纲      中英逐行并列，可选加「追问方向 / 观察记录点」两列
+
+问卷有两种列规格：中英并列的 `survey` 与纯中文的 `survey_cn`。
+中文定稿在先、英文尚未制作的项目，用 `survey_cn` 先出纯中文版；
+本地化完成后再换成 `survey`。两者共用同一个构建函数，行格式只差英文那一格。
 
 常见的表清单：
 
     需求梳理 · 玩家筛选问卷 · 无主持人访谈大纲              （三表）
     需求梳理 · 玩家筛选问卷 · 无主持人访谈大纲 · 有主持人访谈大纲 （四表）
     玩家筛选问卷 A · 玩家筛选问卷 B                        （只出问卷，不出大纲）
+    需求梳理 · 题材偏好问卷（纯中文）                       （满意度问卷的模块，暂不出英文）
 
 用法
 ----
-1. 修改下方「内容区」：填 NEEDS / SURVEY / OUTLINE_*，再在 META["sheets"] 里排列表序。
+1. 修改下方「内容区」：填 NEEDS / SURVEY / SURVEY_CN / OUTLINE_*，再在 META["sheets"] 里排列表序。
 2. **把同目录的 validate_xlsx.py 一并复制过来**（否则自动校验会静默跳过）。
+   若确实忘了复制，脚本会自动到技能安装目录去找；两处都没有才会跳过，并明确提示。
 3. 运行：python build_research_xlsx.py <输出文件.xlsx>
    - 若省略文件名，默认输出 `META["filename"]`。
 
@@ -28,6 +35,7 @@
 依赖：openpyxl
 """
 import math
+import os
 import sys
 
 from openpyxl import Workbook
@@ -80,6 +88,9 @@ def _align(h="left", v="top", wrap=True):
 
 # 单元格样式表：key → (字号, 加粗, 颜色, 斜体, 填充, 水平对齐, 垂直对齐)
 # 字体名由所在列决定（中文列用 FONT_CN，英文列用 FONT_EN），不在此处写死。
+# `judge` / `stop` 两个 key 服务于问卷的「问卷逻辑」列：
+#   judge → 一般逻辑（跳转、互斥、需填文本）
+#   stop  → 终止类逻辑，红色加粗
 _STYLE_SPEC = {
     "title":   (12, True,  "FFFFFF", False, "334E5C", "left",   "center"),
     "note":    (9,  False, "6B7C88", True,  "F7F9FB", "left",   "center"),
@@ -227,10 +238,17 @@ def blank(count):
 COLUMNS_6 = ("模块", "目的", "题号", "题型", "中文", "English")
 COLUMNS_8 = COLUMNS_6 + ("追问方向", "观察记录点")
 
+# 问卷的两种列规格。末列统一叫「问卷逻辑」，记录题目之间的跳转与因果关系：
+# 甄别问卷里写的是终止与通过，满意度问卷里写的是跳转、互斥与需填文本。
+# 列名统一，语义由每份表自己的内容决定。
+COLUMNS_SURVEY = ("题型", "题号", "中文", "English", "问卷逻辑")
+COLUMNS_SURVEY_CN = ("题型", "题号", "中文", "问卷逻辑")
+
 # 各类型的列宽。大纲按列数取不同预设（八列时收窄中文列，控制横向总宽）。
 WIDTHS = {
     "needs": (17, 9, 112),
     "survey": (11, 8, 54, 54, 27),
+    "survey_cn": (11, 8, 80, 36),
     "outline": {
         6: (19, 21, 8, 14, 50, 50),
         8: (19, 21, 8, 12, 44, 44, 36, 36),
@@ -241,6 +259,7 @@ WIDTHS = {
 TAB_COLORS = {
     "needs": "334E5C",
     "survey": "3F6E8C",
+    "survey_cn": "3F6E8C",
     "outline": ("6B8E7F", "7A6A9B", "8E7F6B"),
 }
 
@@ -279,15 +298,16 @@ NEEDS = [
     ("muted", "素材", "……：待定"),
 ]
 
-# ---------------------------------------------------------------- 玩家筛选问卷
+# ---------------------------------------------------------------- 问卷（中英并列）
 # 每项为 ("类型", ...)：
 #   section → ("section", "分节标题")
 #   prose   → ("prose", [(中文, 英文), ...])
-#             开场/结束语。每一对被拆成一行；
+#             开场或结束语。每一对被拆成一行；
 #             若要把整段文字放在同一个单元格里，写成单个元组、用 \n 在字符串内换行。
-#   q       → ("q", 题型, 题号, 中文题干, 英文题干, 判定, [(中文选项, 英文选项, 标记), ...])
-#             标记留空 = 通过；填 "终止" = 该项终止。
-#             判定列照 md 写，不自行改成"机筛"或别的措辞。
+#   q       → ("q", 题型, 题号, 中文题干, 英文题干, 问卷逻辑, [(中文选项, 英文选项, 逻辑), ...])
+#             题目行的「问卷逻辑」是整题的默认值；选项行的逻辑写在每个选项上。
+#             逻辑留空 = 无特殊行为；甄别问卷里写 "终止" 的项，脚本按红色加粗渲染。
+#             逻辑列照 md 写，不自行改成"机筛"或别的措辞。
 SURVEY = [
     ("section", "开场说明"),
     ("prose", [
@@ -296,13 +316,50 @@ SURVEY = [
     ("section", "第一部分：……"),
     ("q", "单选", "Q1",
      "……", "……",
-     "……",
+     "",
      [("……", "……", ""),
       ("……", "……", "终止")]),
     ("section", "结束语"),
     ("prose", [
         ("……\n……", "……\n……"),
     ]),
+]
+
+# ---------------------------------------------------------------- 问卷（纯中文）
+# 用于中文定稿在先、英文版尚未制作的场景。行格式比 SURVEY 少一处英文：
+#   section → ("section", "分节标题")
+#   prose   → ("prose", ["段落", ...])          每个元素占一行
+#   q       → ("q", 题型, 题号, 题干, [(选项, 逻辑), ...])
+#             题型、题号两列在该题所有行上纵向合并
+#   field   → ("field", "题干附属的输入行", "问卷逻辑")
+#             追加在当前题目之后，与上一题共用题型与题号。
+#             用于「用一句话说说为什么」这类并列在选择题下的补充输入；
+#             它的存在前提是平台支持"选择题 + 附加文本"，不支持时要另立题号。
+#
+# 「问卷逻辑」记录玩家选了这一项之后会发生什么，写在触发它的那一行上：
+#   跳转     → "跳转到 Q6"
+#   终止     → "本模块结束"（红色加粗，用 "终止" 字样以外的一般描述也行）
+#   互斥     → "与其余色调选项互斥，不可同时选中"
+#   需填文本 → "需填写文本（必填，≤20 字符）"
+# 吸引点类题目（依赖前一道题才有意义的那种）不写条件，其出现与否由上一条跳转隐含。
+SURVEY_CN = [
+    ("section", "开场说明"),
+    ("prose", [
+        "……",
+    ]),
+    ("section", "第一部分 · ……"),
+    ("q", "单选", "Q1",
+     "……",
+     [("……", ""),
+      ("其他", "需填写文本（必填，≤20 字符）")]),
+    ("q", "填空", "Q2",
+     "……",
+     [("暂时想不起来，跳过这个模块", "跳转到 Q4")]),
+    ("q", "多选", "Q3",
+     "……（最多选 3 项）",
+     [("……", ""),
+      ("……", "")]),
+    ("field", "用一句话说说为什么（选填）", ""),
 ]
 
 # ---------------------------------------------------------------- 访谈大纲（无主持人）
@@ -336,6 +393,7 @@ OUTLINE_MODERATED = [
 
 # ---------------------------------------------------------------- 表清单
 # sheets 的顺序就是工作表顺序。三类都可放任意多个实例，也可以不放。
+# 表名跟随用途：「玩家筛选问卷」（甄别）、「题材偏好问卷」「满意度问卷」（满意度类）……
 META = {
     "filename": "【YYMM】项目名.xlsx",
     "sheets": [
@@ -345,6 +403,8 @@ META = {
          "content": OUTLINE_UNMODERATED},
         {"type": "outline", "name": "有主持人访谈大纲",
          "content": OUTLINE_MODERATED, "columns": COLUMNS_8},
+        # 纯中文的问卷（不列英文列）换成这一条：
+        # {"type": "survey_cn", "name": "题材偏好问卷", "content": SURVEY_CN},
     ],
 }
 
@@ -412,10 +472,15 @@ def build_needs(workbook, spec):
 
 
 def build_survey(workbook, spec):
+    """问卷表（中英并列）：题型 | 题号 | 中文 | English | 问卷逻辑。"""
+    columns = spec.get("columns", COLUMNS_SURVEY)
+    if columns != COLUMNS_SURVEY:
+        raise ValueError(
+            f'问卷「{spec["name"]}」的 columns 为 {columns}；'
+            f'中英并列问卷只能用 COLUMNS_SURVEY，纯中文请把 type 写成 survey_cn。')
     sheet = Sheet(workbook, spec["name"], resolve_widths(spec),
                   resolve_tab_color(spec, 0), en_columns=(4,))
-    sheet.add([("题型", "header", 1), ("题号", "header", 1),
-               ("中文", "header", 1), ("English", "header", 1), ("判定", "header", 1)])
+    sheet.add([(name, "header", 1) for name in columns])
     for item in spec["content"]:
         kind = item[0]
         if kind == "section":
@@ -424,10 +489,10 @@ def build_survey(workbook, spec):
             for cn, en in item[1]:
                 sheet.add(blank(2) + [(cn, "body", 1), (en, "body", 1), ("", "body", 1)])
         elif kind == "q":
-            _, qtype, qno, stem_cn, stem_en, judge, options = item
+            _, qtype, qno, stem_cn, stem_en, logic, options = item
             first = sheet.row + 1
             sheet.add([(qtype, "label", 1), (qno, "label", 1),
-                       (stem_cn, "body", 1), (stem_en, "body", 1), (judge, "judge", 1)])
+                       (stem_cn, "body", 1), (stem_en, "body", 1), (logic, "judge", 1)])
             for cn, en, mark in options:
                 sheet.add(blank(2) + [(cn, "body", 1), (en, "body", 1),
                                       (mark, "stop" if mark else "body", 1)])
@@ -435,7 +500,62 @@ def build_survey(workbook, spec):
             sheet.merge_down(2, first, sheet.row)
             sheet.mark_block_top(first)
         else:
-            raise ValueError(f"玩家筛选问卷不认识的类型：{kind}")
+            raise ValueError(f"问卷不认识的类型：{kind}")
+    sheet.finish("A2")
+
+
+def build_survey_cn(workbook, spec):
+    """问卷表（纯中文）：题型 | 题号 | 中文 | 问卷逻辑。
+
+    与中英并列版的差别只有一处：没有 English 列，行里也不写英文。
+    """
+    columns = spec.get("columns", COLUMNS_SURVEY_CN)
+    if columns != COLUMNS_SURVEY_CN:
+        raise ValueError(
+            f'纯中文问卷「{spec["name"]}」的 columns 为 {columns}；'
+            f'应为 COLUMNS_SURVEY_CN。')
+    sheet = Sheet(workbook, spec["name"], resolve_widths(spec),
+                  resolve_tab_color(spec, 0))
+    sheet.add([(name, "header", 1) for name in columns])
+    block_first = None
+
+    def close_block():
+        """把当前题目的「题型 / 题号」两列纵向合并。"""
+        nonlocal block_first
+        if block_first is not None and sheet.row > block_first:
+            sheet.merge_down(1, block_first, sheet.row)
+            sheet.merge_down(2, block_first, sheet.row)
+        block_first = None
+
+    for item in spec["content"]:
+        kind = item[0]
+        if kind == "section":
+            close_block()
+            sheet.add([(item[1], "section", len(columns))])
+        elif kind == "prose":
+            close_block()
+            for paragraph in item[1]:
+                sheet.add(blank(2) + [(paragraph, "body", 1), ("", "body", 1)])
+        elif kind == "q":
+            close_block()
+            _, qtype, qno, stem, options = item
+            sheet.add([(qtype, "label", 1), (qno, "label", 1),
+                       (stem, "body", 1), ("", "body", 1)])
+            block_first = sheet.row
+            sheet.mark_block_top(sheet.row)
+            for option, logic in options:
+                sheet.add(blank(2) + [(option, "body", 1),
+                                      (logic, "stop" if logic else "body", 1)])
+        elif kind == "field":
+            if block_first is None:
+                raise ValueError(
+                    f'纯中文问卷「{spec["name"]}」的 field 行没有可依附的题目；'
+                    f'它必须紧跟在某道题之后。')
+            _, text, logic = item
+            sheet.add(blank(2) + [(text, "scale", 1), (logic, "judge", 1)])
+        else:
+            raise ValueError(f"纯中文问卷不认识的类型：{kind}")
+    close_block()
     sheet.finish("A2")
 
 
@@ -532,8 +652,39 @@ def _backup_if_exists(path):
     print(f"  已备份原文件 → {target}")
 
 
+def load_validator():
+    """找到 validate_xlsx 模块。同目录优先，其次技能安装目录。
+
+    校验脚本漏复制时不该静默跳过——「已生成」的提示照常打印，
+    很容易被当成一切正常。所以两处都找过才算真的没有。
+    """
+    try:
+        import validate_xlsx
+        return validate_xlsx
+    except ImportError:
+        pass
+    fallback = os.path.join(os.path.expanduser("~"), ".workbuddy", "skills",
+                            "md-to-research-xlsx", "scripts")
+    if os.path.isdir(fallback) and fallback not in sys.path:
+        sys.path.insert(0, fallback)
+        try:
+            import validate_xlsx
+            print(f"（校验脚本取自技能目录：{fallback}）")
+            return validate_xlsx
+        except ImportError:
+            pass
+    return None
+
+
 def main():
-    output = sys.argv[1] if len(sys.argv) > 1 else META["filename"]
+    # 参数里除开关以外的那一个才是输出文件名。开关写成 --no-backup，
+    # 顺序随意；不这样过滤的话，把开关写在前面会被当成文件名，
+    # 生成一个名叫 "--no-backup" 的文件，且不报错。
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    output = args[0] if args else META["filename"]
+    unknown = [a for a in args[1:]]
+    if unknown:
+        print(f"（忽略多余的参数：{unknown}）")
     if "--no-backup" not in sys.argv:
         _backup_if_exists(output)
 
@@ -546,30 +697,35 @@ def main():
             build_needs(workbook, spec)
         elif kind == "survey":
             build_survey(workbook, spec)
+        elif kind == "survey_cn":
+            build_survey_cn(workbook, spec)
         elif kind == "outline":
             build_outline(workbook, spec, outline_index)
             outline_index += 1
         else:
-            raise ValueError(f'不认识的表类型：{kind}（应为 needs / survey / outline）')
+            raise ValueError(
+                f'不认识的表类型：{kind}'
+                f'（应为 needs / survey / survey_cn / outline）')
     workbook.save(output)
 
     print("已生成:", output)
     for sheet in workbook.worksheets:
         print(f"  {sheet.title}: {sheet.max_row} 行 x {sheet.max_column} 列")
 
-    # 自动校验（需同目录有 validate_xlsx.py）
-    try:
-        import validate_xlsx
-        _, problems = validate_xlsx.check(output)
-        if problems:
-            print(f"\n校验发现 {len(problems)} 个问题：")
-            for sheet_name, coord, kind, detail in problems[:60]:
-                print(f"  [{sheet_name}] {coord} {kind} {detail}")
-        else:
-            print("\n校验通过：无裁切、无合并重叠、无 Markdown 残留。")
-    except ImportError:
-        print("\n（未找到 validate_xlsx.py，跳过自动校验；"
-              "请把技能里的 scripts/validate_xlsx.py 复制到工作目录）")
+    # 自动校验
+    validator = load_validator()
+    if validator is None:
+        print("\n未找到 validate_xlsx.py，本次跳过自动校验。")
+        print("  请把技能里的 scripts/validate_xlsx.py 复制到工作目录后重跑；")
+        print("  「已生成」不等于校验通过，行高裁切与合并重叠都查不出来。")
+        return
+    _, problems = validator.check(output)
+    if problems:
+        print(f"\n校验发现 {len(problems)} 个问题：")
+        for sheet_name, coord, kind, detail in problems[:60]:
+            print(f"  [{sheet_name}] {coord} {kind} {detail}")
+    else:
+        print("\n校验通过：无裁切、无合并重叠、无 Markdown 残留。")
 
 
 if __name__ == "__main__":
