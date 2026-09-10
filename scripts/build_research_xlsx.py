@@ -1,0 +1,576 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""用研文档 → Excel 构建器（模板脚本 · 三类表）
+
+表分三类，每类可放任意多个实例（含 0 个）：
+
+    needs   需求梳理        纯中文
+    survey  玩家筛选问卷    中英逐行并列
+    outline 访谈大纲        中英逐行并列，可选加「追问方向 / 观察记录点」两列
+
+常见的表清单：
+
+    需求梳理 · 玩家筛选问卷 · 无主持人访谈大纲              （三表）
+    需求梳理 · 玩家筛选问卷 · 无主持人访谈大纲 · 有主持人访谈大纲 （四表）
+    玩家筛选问卷 A · 玩家筛选问卷 B                        （只出问卷，不出大纲）
+
+用法
+----
+1. 修改下方「内容区」：填 NEEDS / SURVEY / OUTLINE_*，再在 META["sheets"] 里排列表序。
+2. **把同目录的 validate_xlsx.py 一并复制过来**（否则自动校验会静默跳过）。
+3. 运行：python build_research_xlsx.py <输出文件.xlsx>
+   - 若省略文件名，默认输出 `META["filename"]`。
+
+样式区（Sheet 类、行高估算）是固化规范，一般不需要改。
+详细格式约定见 references/format-spec.md。
+完整实战样例见 references/example-4sheets.py。
+
+依赖：openpyxl
+"""
+import math
+import sys
+
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
+
+# ============================================================================
+# 一、样式与构建工具（固化规范 · 一般不改）
+# ============================================================================
+
+FONT_CN = "微软雅黑"      # 中文列字体
+FONT_EN = "Aptos"         # 英文列字体（Office 2024+ 默认；未安装时会回退）
+LINE_COLOR = "DCE3E8"
+_side = Side(style="thin", color=LINE_COLOR)
+_side_strong = Side(style="medium", color="B8C6D0")
+BORDER = Border(left=_side, right=_side, top=_side, bottom=_side)
+
+LINE_HEIGHT = 15.2      # 每行文字占用的磅值
+ROW_PADDING = 5         # 单元格上下留白
+ROW_MIN = 24            # 最小行高
+ROW_MAX = 300           # 最大行高（防止极端长文撑爆）
+BASE_SIZE = 10          # 正文字号
+
+# 打印设置（留档、导出 PDF 时生效）
+PRINT_LAYOUT = {
+    "orientation": "landscape",   # 横向
+    "fit_to_width": 1,            # 缩放到一页宽
+    "repeat_header": "1:1",       # 每页重复表头行（表头在第 1 行）
+    "margin": 0.4,                # 页边距（英寸）
+    "show_page_number": True,     # 页脚显示页码
+}
+
+# 界面设置
+VIEW_ZOOM = 100               # 默认缩放
+FREEZE_ROWS = 1               # 冻结首行（表头）
+
+
+def _font(size=BASE_SIZE, bold=False, color="1F2A33", italic=False, english=False):
+    return Font(name=FONT_EN if english else FONT_CN,
+                size=size, bold=bold, color=color, italic=italic)
+
+
+def _fill(color):
+    return PatternFill("solid", fgColor=color)
+
+
+def _align(h="left", v="top", wrap=True):
+    return Alignment(horizontal=h, vertical=v, wrap_text=wrap)
+
+
+# 单元格样式表：key → (字号, 加粗, 颜色, 斜体, 填充, 水平对齐, 垂直对齐)
+# 字体名由所在列决定（中文列用 FONT_CN，英文列用 FONT_EN），不在此处写死。
+_STYLE_SPEC = {
+    "title":   (12, True,  "FFFFFF", False, "334E5C", "left",   "center"),
+    "note":    (9,  False, "6B7C88", True,  "F7F9FB", "left",   "center"),
+    "header":  (10, True,  "FFFFFF", False, "5C7A8A", "center", "center"),
+    "section": (10, True,  "1F3A4D", False, "E3EDF3", "left",   "center"),
+    "module":  (10, True,  "1F3A4D", False, "EEF4F8", "left",   "center"),
+    "key":     (10, True,  "1F3A4D", False, "F4F7F9", "left",   "center"),
+    "label":   (10, False, "334E5C", False, None,     "center", "center"),
+    "judge":   (10, False, "8A4A2B", False, None,     "left",   "top"),
+    "stop":    (10, True,  "A32D2D", False, None,     "left",   "top"),
+    "scale":   (10, False, "334E5C", False, "F7F9FB", "left",   "top"),
+    "muted":   (10, False, "6B7C88", False, None,     "left",   "top"),
+    "body":    (10, False, "1F2A33", False, None,     "left",   "top"),
+}
+
+
+def make_style(style_key, english=False):
+    """按样式 key + 是否英文列，生成 (font, fill, alignment)。"""
+    size, bold, color, italic, fill_color, h, v = _STYLE_SPEC[style_key]
+    font = _font(size, bold, color, italic, english=english)
+    fill = _fill(fill_color) if fill_color else None
+    return font, fill, _align(h, v)
+
+
+def clean(text):
+    """去掉 Markdown 粗体/斜体标记。"""
+    if text is None:
+        return ""
+    return str(text).replace("**", "").replace("*", "")
+
+
+def display_len(text):
+    """显示宽度：中日韩字符按 2 计，其余按 1 计。"""
+    return sum(2 if ord(ch) > 0x2E80 else 1 for ch in str(text))
+
+
+def estimate_lines(text, width):
+    """估算文本在给定列宽下需要几行。"""
+    if not text:
+        return 1
+    usable = max(width - 2.5, 4)
+    total = 0
+    for segment in str(text).split("\n"):
+        total += max(1, math.ceil(display_len(segment) / usable))
+    return total
+
+
+class Sheet:
+    """按行追加内容，自动计算行高、处理合并、按列切换中英字体。"""
+
+    def __init__(self, workbook, name, widths, tab_color=None, en_columns=()):
+        self.ws = workbook.create_sheet(name)
+        self.widths = widths
+        self.ncols = len(widths)
+        self.en_columns = set(en_columns)   # 英文列的列号（1 起）
+        for idx, width in enumerate(widths, 1):
+            self.ws.column_dimensions[get_column_letter(idx)].width = width
+        self.ws.sheet_view.showGridLines = False
+        if tab_color:
+            self.ws.sheet_properties.tabColor = tab_color
+        self.row = 0
+
+    def add(self, cells, height=None):
+        """cells: [(文本, 样式key, 跨列数), ...]"""
+        self.row += 1
+        column = 1
+        needed = 0
+        for text, style_key, span in cells:
+            text = clean(text)
+            cell = self.ws.cell(row=self.row, column=column, value=text)
+            # 字体判定：整格都在英文列上才算英文格；
+            # 跨列（标题、分节等）默认用中文字体。
+            english = (span == 1 and column in self.en_columns)
+            font, fill, align = make_style(style_key, english)
+            cell.font = font
+            cell.alignment = align
+            if fill is not None:
+                cell.fill = fill
+            effective_width = sum(self.widths[column - 1: column - 1 + span])
+            if style_key != "title":
+                lines = estimate_lines(text, effective_width)
+                needed = max(needed, lines * LINE_HEIGHT + ROW_PADDING)
+            if span > 1:
+                self.ws.merge_cells(start_row=self.row, start_column=column,
+                                    end_row=self.row, end_column=column + span - 1)
+            column += span
+        self.ws.row_dimensions[self.row].height = (
+            height if height else max(ROW_MIN, min(needed, ROW_MAX)))
+        return self.row
+
+    def merge_down(self, column, first, last):
+        """纵向合并某列。"""
+        if last > first:
+            self.ws.merge_cells(start_row=first, start_column=column,
+                                end_row=last, end_column=column)
+
+    def mark_block_top(self, row):
+        """给区块首行加粗上边框，视觉上分隔题目。"""
+        for column in range(1, self.ncols + 1):
+            cell = self.ws.cell(row=row, column=column)
+            cell.border = Border(left=_side, right=_side,
+                                 top=_side_strong, bottom=_side)
+
+    def finish(self, freeze):
+        self.ws.freeze_panes = freeze
+        for row in self.ws.iter_rows(min_row=1, max_row=self.ws.max_row,
+                                     max_col=self.ncols):
+            for cell in row:
+                if cell.border.top is None or cell.border.top.style is None:
+                    cell.border = BORDER
+        self._apply_print_settings()
+        self._apply_view_settings()
+
+    def _apply_print_settings(self):
+        """打印设置：横向、缩放到一页宽、重复表头、页脚页码。"""
+        ws = self.ws
+        ws.page_setup.orientation = PRINT_LAYOUT["orientation"]
+        ws.page_setup.fitToWidth = PRINT_LAYOUT["fit_to_width"]
+        ws.page_setup.fitToHeight = 0
+        ws.sheet_properties.pageSetUpPr.fitToPage = True
+        ws.print_title_rows = PRINT_LAYOUT["repeat_header"]
+        margin = PRINT_LAYOUT["margin"]
+        ws.page_margins.left = ws.page_margins.right = margin
+        ws.page_margins.top = ws.page_margins.bottom = margin
+        if PRINT_LAYOUT["show_page_number"]:
+            ws.oddFooter.center.text = "第 &P 页 / 共 &N 页"
+            ws.oddFooter.center.size = 8
+            ws.oddFooter.center.color = "808080"
+
+    def _apply_view_settings(self):
+        """界面设置：缩放、选中首个内容格。"""
+        self.ws.sheet_view.zoomScale = VIEW_ZOOM
+        self.ws.sheet_view.zoomScaleNormal = VIEW_ZOOM
+
+
+def blank(count):
+    """生成 count 个空单元格。"""
+    return [("", "body", 1) for _ in range(count)]
+
+# ============================================================================
+# 二、表结构定义（三类表的列与列宽 · 一般不改）
+# ============================================================================
+
+# 大纲的列集。默认六列；要放追问与观察记录点就换 COLUMNS_8。
+COLUMNS_6 = ("模块", "目的", "题号", "题型", "中文", "English")
+COLUMNS_8 = COLUMNS_6 + ("追问方向", "观察记录点")
+
+# 各类型的列宽。大纲按列数取不同预设（八列时收窄中文列，控制横向总宽）。
+WIDTHS = {
+    "needs": (17, 9, 112),
+    "survey": (11, 8, 54, 54, 27),
+    "outline": {
+        6: (19, 21, 8, 14, 50, 50),
+        8: (19, 21, 8, 12, 44, 44, 36, 36),
+    },
+}
+
+# 标签页颜色。outline 多实例时按顺序取色，便于区分。
+TAB_COLORS = {
+    "needs": "334E5C",
+    "survey": "3F6E8C",
+    "outline": ("6B8E7F", "7A6A9B", "8E7F6B"),
+}
+
+# 大纲的行类型 → 目标列名。列名必须出现在该表的 columns 里，否则报错。
+OUTLINE_ROW_COLUMNS = {
+    "fu": "追问方向",
+    "obs": "观察记录点",
+}
+
+# ============================================================================
+# 三、内容区（每次改这里）
+# ============================================================================
+
+# ---------------------------------------------------------------- 需求梳理
+# 每项为 ("类型", 标签, 内容)：
+#   kv      → 标签 + 单段内容
+#   kvlist  → 标签 + 多个 (子标签, 内容) 行
+#   numlist → 标签 + 多个 (序号, 内容) 行
+#   muted   → kv 的灰色版，用于「待定」
+NEEDS = [
+    ("kv", "项目", "……"),
+    ("kv", "调研背景", "……"),
+    ("kv", "核心验证对象", "……"),
+    ("numlist", "研究目标", [
+        ("……", "研究假设：……"),
+    ]),
+    ("kv", "研究方法", "……"),
+    ("kv", "单场时长", "……"),
+    ("kvlist", "样本条件", [
+        ("游戏", "……"),
+        ("性别", "……"),
+        ("年龄", "……"),
+    ]),
+    ("kv", "目标国家", "……"),
+    ("muted", "样本量", "待定"),
+    ("muted", "素材", "……：待定"),
+]
+
+# ---------------------------------------------------------------- 玩家筛选问卷
+# 每项为 ("类型", ...)：
+#   section → ("section", "分节标题")
+#   prose   → ("prose", [(中文, 英文), ...])
+#             开场/结束语。每一对被拆成一行；
+#             若要把整段文字放在同一个单元格里，写成单个元组、用 \n 在字符串内换行。
+#   q       → ("q", 题型, 题号, 中文题干, 英文题干, 判定, [(中文选项, 英文选项, 标记), ...])
+#             标记留空 = 通过；填 "终止" = 该项终止。
+#             判定列照 md 写，不自行改成"机筛"或别的措辞。
+SURVEY = [
+    ("section", "开场说明"),
+    ("prose", [
+        ("……", "……"),
+    ]),
+    ("section", "第一部分：……"),
+    ("q", "单选", "Q1",
+     "……", "……",
+     "……",
+     [("……", "……", ""),
+      ("……", "……", "终止")]),
+    ("section", "结束语"),
+    ("prose", [
+        ("……\n……", "……\n……"),
+    ]),
+]
+
+# ---------------------------------------------------------------- 访谈大纲（无主持人）
+# 每项为 ("类型", ...)：
+#   page  → ("page", "Task B · Page 5", "本页目的")
+#   kv    → ("kv", 行标签, 中文, 英文)
+#   sub   → ("sub", 中文引导语, 英文引导语)
+#   q     → ("q", 目的, 题号, 题型, 中文题干, 英文题干)
+#   scale → ("scale", 中文量表说明, 英文量表说明)
+#   opt   → ("opt", 中文选项, 英文选项)
+#   题号 / 题型留空字符串表示该行不需要。
+OUTLINE_UNMODERATED = [
+    ("page", "Task A · Instruction", "开场说明：……"),
+    ("kv", "页面标题", "……", "……"),
+    ("q", "轻背景：……", "Q1", "单选", "……", "……"),
+    ("opt", "……", "……"),
+]
+
+# ---------------------------------------------------------------- 访谈大纲（有主持人）
+# 同上，另加两种行类型（需在 columns 里声明对应列）：
+#   fu  → ("fu", 中文追问，每行一条)    落到「追问方向」列
+#   obs → ("obs", 中文记录点)           落到「观察记录点」列
+OUTLINE_MODERATED = [
+    ("page", "环节 1 · ……", "……"),
+    ("kv", "提问话术", "……", "……"),
+    ("obs", "……"),
+    ("q", "……", "Q1", "口头回答", "……", "……"),
+    ("fu", "……"),
+    ("obs", "……"),
+]
+
+# ---------------------------------------------------------------- 表清单
+# sheets 的顺序就是工作表顺序。三类都可放任意多个实例，也可以不放。
+META = {
+    "filename": "【YYMM】项目名.xlsx",
+    "sheets": [
+        {"type": "needs", "name": "需求梳理", "content": NEEDS},
+        {"type": "survey", "name": "玩家筛选问卷", "content": SURVEY},
+        {"type": "outline", "name": "无主持人访谈大纲",
+         "content": OUTLINE_UNMODERATED},
+        {"type": "outline", "name": "有主持人访谈大纲",
+         "content": OUTLINE_MODERATED, "columns": COLUMNS_8},
+    ],
+}
+
+# ============================================================================
+# 四、构建入口
+# ============================================================================
+
+
+def resolve_widths(spec):
+    """按类型与列数取列宽，允许 spec["widths"] 覆盖。"""
+    kind = spec["type"]
+    if kind == "outline":
+        ncols = len(spec.get("columns", COLUMNS_6))
+        table = WIDTHS["outline"]
+        if ncols not in table:
+            raise ValueError(
+                f'大纲「{spec["name"]}」列数为 {ncols}，没有对应的列宽预设；'
+                f'请在本文件的 WIDTHS["outline"] 里补一条。')
+        widths = list(table[ncols])
+    else:
+        widths = list(WIDTHS[kind])
+    if "widths" in spec:
+        widths = [spec["widths"][i] if i in spec["widths"] else w
+                  for i, w in enumerate(widths)]
+    return widths
+
+
+def resolve_tab_color(spec, outline_index):
+    """标签页颜色：spec 里可显式指定，否则按类型取；大纲多实例顺延取色。"""
+    if "tab_color" in spec:
+        return spec["tab_color"]
+    kind = spec["type"]
+    if kind == "outline":
+        palette = TAB_COLORS["outline"]
+        return palette[outline_index % len(palette)]
+    return TAB_COLORS[kind]
+
+
+def build_needs(workbook, spec):
+    sheet = Sheet(workbook, spec["name"], resolve_widths(spec),
+                  resolve_tab_color(spec, 0))
+    sheet.add([("项目", "header", 1), ("序号", "header", 1), ("内容", "header", 1)])
+    for item in spec["content"]:
+        kind = item[0]
+        if kind in ("kv", "muted"):
+            style = "muted" if kind == "muted" else "body"
+            sheet.add([(item[1], "key", 1), ("", "body", 1), (item[2], style, 1)])
+        elif kind == "kvlist":
+            first = sheet.row + 1
+            for sub_label, content in item[2]:
+                sheet.add([(item[1] if sheet.row + 1 == first else "", "key", 1),
+                           (sub_label, "label", 1), (content, "body", 1)])
+            sheet.merge_down(1, first, sheet.row)
+        elif kind == "numlist":
+            first = sheet.row + 1
+            for index, content in enumerate(item[2], 1):
+                if isinstance(content, (tuple, list)):
+                    content = "\n".join(content)
+                sheet.add([(item[1] if index == 1 else "", "key", 1),
+                           (str(index), "label", 1), (content, "body", 1)])
+            sheet.merge_down(1, first, sheet.row)
+        else:
+            raise ValueError(f"需求梳理不认识的类型：{kind}")
+    sheet.finish("A2")
+
+
+def build_survey(workbook, spec):
+    sheet = Sheet(workbook, spec["name"], resolve_widths(spec),
+                  resolve_tab_color(spec, 0), en_columns=(4,))
+    sheet.add([("题型", "header", 1), ("题号", "header", 1),
+               ("中文", "header", 1), ("English", "header", 1), ("判定", "header", 1)])
+    for item in spec["content"]:
+        kind = item[0]
+        if kind == "section":
+            sheet.add([(item[1], "section", 5)])
+        elif kind == "prose":
+            for cn, en in item[1]:
+                sheet.add(blank(2) + [(cn, "body", 1), (en, "body", 1), ("", "body", 1)])
+        elif kind == "q":
+            _, qtype, qno, stem_cn, stem_en, judge, options = item
+            first = sheet.row + 1
+            sheet.add([(qtype, "label", 1), (qno, "label", 1),
+                       (stem_cn, "body", 1), (stem_en, "body", 1), (judge, "judge", 1)])
+            for cn, en, mark in options:
+                sheet.add(blank(2) + [(cn, "body", 1), (en, "body", 1),
+                                      (mark, "stop" if mark else "body", 1)])
+            sheet.merge_down(1, first, sheet.row)
+            sheet.merge_down(2, first, sheet.row)
+            sheet.mark_block_top(first)
+        else:
+            raise ValueError(f"玩家筛选问卷不认识的类型：{kind}")
+    sheet.finish("A2")
+
+
+def build_outline(workbook, spec, outline_index):
+    columns = spec.get("columns", COLUMNS_6)
+    ncols = len(columns)
+    widths = resolve_widths(spec)
+    en_columns = (columns.index("English") + 1,) if "English" in columns else ()
+    sheet = Sheet(workbook, spec["name"], widths,
+                  resolve_tab_color(spec, outline_index), en_columns=en_columns)
+    sheet.add([(name, "header", 1) for name in columns])
+
+    # 按列名定位：列没声明却用了对应行类型，就当场报错，不静默丢内容。
+    def col_of(row_kind, label):
+        name = OUTLINE_ROW_COLUMNS.get(row_kind, label)
+        if name not in columns:
+            raise ValueError(
+                f'大纲「{spec["name"]}」用了 "{row_kind}" 行，但 columns 里没有「{name}」列。')
+        return columns.index(name) + 1
+
+    page_first = None
+    block_first = None
+
+    def close_block():
+        """把当前题目的「目的 / 题号 / 题型」三列纵向合并。"""
+        nonlocal block_first
+        if block_first is not None and sheet.row > block_first:
+            for name in ("目的", "题号", "题型"):
+                if name in columns:
+                    sheet.merge_down(columns.index(name) + 1, block_first, sheet.row)
+        block_first = None
+
+    def pad(cells):
+        """补足到 ncols 列。"""
+        return cells + [("", "body", 1)] * (ncols - len(cells))
+
+    for item in spec["content"]:
+        kind = item[0]
+        if kind == "page":
+            close_block()
+            if page_first is not None:
+                sheet.merge_down(1, page_first, sheet.row)
+            sheet.add([(item[1], "module", 1), (item[2], "section", ncols - 1)],
+                      height=36)
+            page_first = sheet.row
+        elif kind == "kv":
+            close_block()
+            _, label, cn, en = item
+            sheet.add(pad([("", "module", 1), (label, "key", 1), ("", "label", 1),
+                           ("", "label", 1), (cn, "body", 1), (en, "body", 1)]))
+        elif kind == "sub":
+            close_block()
+            _, cn, en = item
+            sheet.add(pad([("", "module", 1), ("页面引导语", "key", 1), ("", "label", 1),
+                           ("", "label", 1), (cn, "body", 1), (en, "body", 1)]))
+        elif kind == "q":
+            close_block()
+            _, purpose, qno, qtype, cn, en = item
+            sheet.add(pad([("", "module", 1), (purpose, "key", 1), (qno, "label", 1),
+                           (qtype, "label", 1), (cn, "body", 1), (en, "body", 1)]))
+            block_first = sheet.row
+            sheet.mark_block_top(sheet.row)
+        elif kind in ("scale", "opt"):
+            _, cn, en = item
+            style = "scale" if kind == "scale" else "body"
+            sheet.add(pad([("", "module", 1), ("", "body", 1), ("", "body", 1),
+                           ("", "body", 1), (cn, style, 1), (en, style, 1)]))
+        elif kind in ("fu", "obs"):
+            _, cn = item
+            cells = [("", "body", 1)] * ncols
+            cells[col_of(kind, "") - 1] = (cn, "body", 1)
+            sheet.add(cells)
+        else:
+            raise ValueError(f"访谈大纲不认识的类型：{kind}")
+    close_block()
+    if page_first is not None:
+        sheet.merge_down(1, page_first, sheet.row)
+    sheet.finish("A2")
+
+
+def _backup_if_exists(path):
+    """目标文件已存在时，先备份到 _backup/ 再生成。"""
+    import os
+    import shutil
+    import datetime
+    if not os.path.exists(path):
+        return
+    backup_dir = os.path.join(os.path.dirname(os.path.abspath(path)) or ".", "_backup")
+    os.makedirs(backup_dir, exist_ok=True)
+    stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    name = os.path.splitext(os.path.basename(path))[0]
+    target = os.path.join(backup_dir, f"{name}_{stamp}.xlsx")
+    shutil.copy2(path, target)
+    print(f"  已备份原文件 → {target}")
+
+
+def main():
+    output = sys.argv[1] if len(sys.argv) > 1 else META["filename"]
+    if "--no-backup" not in sys.argv:
+        _backup_if_exists(output)
+
+    workbook = Workbook()
+    workbook.remove(workbook.active)
+    outline_index = 0
+    for spec in META["sheets"]:
+        kind = spec["type"]
+        if kind == "needs":
+            build_needs(workbook, spec)
+        elif kind == "survey":
+            build_survey(workbook, spec)
+        elif kind == "outline":
+            build_outline(workbook, spec, outline_index)
+            outline_index += 1
+        else:
+            raise ValueError(f'不认识的表类型：{kind}（应为 needs / survey / outline）')
+    workbook.save(output)
+
+    print("已生成:", output)
+    for sheet in workbook.worksheets:
+        print(f"  {sheet.title}: {sheet.max_row} 行 x {sheet.max_column} 列")
+
+    # 自动校验（需同目录有 validate_xlsx.py）
+    try:
+        import validate_xlsx
+        _, problems = validate_xlsx.check(output)
+        if problems:
+            print(f"\n校验发现 {len(problems)} 个问题：")
+            for sheet_name, coord, kind, detail in problems[:60]:
+                print(f"  [{sheet_name}] {coord} {kind} {detail}")
+        else:
+            print("\n校验通过：无裁切、无合并重叠、无 Markdown 残留。")
+    except ImportError:
+        print("\n（未找到 validate_xlsx.py，跳过自动校验；"
+              "请把技能里的 scripts/validate_xlsx.py 复制到工作目录）")
+
+
+if __name__ == "__main__":
+    main()
