@@ -49,7 +49,7 @@ references/
   example-4sheets.py            实战样例：四张表的完整脚本（3D 二合首测项目）
 scripts/
   build_research_xlsx.py        构建脚本模板（含样式区，填内容区即可用）
-  validate_xlsx.py              生成后的自动校验（行高裁切、合并重叠、Markdown 残留、字体、打印设置）
+  validate_xlsx.py              生成后的自动校验，分两级：错误（行高裁切、合并重叠、Markdown 残留、字体、打印设置、题号缺失/重复、跳转目标不存在）必须修复；提醒（删减关键词命中、层级称呼混用、末板块写法）由人裁决
 ```
 
 ## 用法

@@ -9,19 +9,24 @@
 openpyxl 写入的行高是「估算值」。若文本比行高允许的更长，Excel/WPS 里
 会显示不全。本脚本用与实际渲染一致的宽度模型逐格复核。
 
-同时检查：
-  1. 行高是否足够容纳内容（避免裁切）
-  2. 合并单元格是否重叠（会导致文件损坏或显示异常）
-  3. 是否有 Markdown 残留（**、*）
-  4. 冻结窗格、网格线等排版设置是否到位
+问题分两级（2026-09-10 起）：
+  error   客观错误，必须修复：行高裁切、合并重叠、Markdown 残留、
+          排版设置缺失、字体错列、题号缺失/重复、跳转目标不存在
+  warning 疑似问题，由人裁决：删减关键词命中、层级称呼混用、
+          末板块跳过项的写法
+
+单独运行时只有 error 影响退出码（exit 2）；经 build 脚本运行时
+两类都只打印，不挡生成——保持「报出来、人来修」的工作流。
 
 注意：本脚本用 zipfile 直接读原始 XML 获取列宽，而不是 openpyxl 的
 column_dimensions。原因是 WPS 保存后会把连续列宽合并成
 `<col min="3" max="4" width="54"/>`，openpyxl 读取时会漏掉中间列。
 """
 import math
+import re
 import sys
 import zipfile
+from collections import Counter
 from xml.etree import ElementTree as ET
 
 import openpyxl
@@ -36,6 +41,35 @@ TOLERANCE = 2.0         # 容差
 # 实测（列宽 50 的英文列）：约 53-55 个英文字符/行，故系数取 1.08。
 # 中文按 2 倍宽度计，换算后约为列宽的一半字符。
 EN_WIDTH_FACTOR = 1.08
+
+# ---------------------------------------------------------------------------
+# 内容层面的检查（2026-09-10 新增）
+# ---------------------------------------------------------------------------
+
+# 「问卷逻辑」列里的跳转写法：「跳转到 Q6」「跳过……跳到 Q4」等。
+# 「跳过这个模块」这类不带题号的写法不命中，不参与目标检查。
+JUMP_RE = re.compile(r"跳[转过到至]*[^Q\n]*?Q(\d+)")
+
+# 删减清单关键词：命中说明可能是没删干净的内部内容（warning，由人裁决）。
+# 大小写敏感——"Zoom" 是会议软件，"zoom in" 是缩放操作，不能混。
+# 「问卷逻辑」列不扫：那一列照 md 原样写，内部性质是合法的。
+INTERNAL_KEYWORDS = (
+    "UserTesting", "Unmoderated", "Think-Out-Loud", "Zoom",
+    "共享屏幕", "无人主持", "留档版",
+    "研究落点", "内部备注", "本研究的核心品类", "由平台定向筛选", "硬性门槛题",
+)
+
+# 同一层级称呼的近义词组：同一张表命中两种以上就报（warning）。
+# 「部分」只认「第 X 部分」，避免命中「大部分玩家」这类普通用语。
+# 表头不参与——outline 的「模块」列是固定结构词，不算内容选择。
+# 近义词表按踩坑记录逐次扩充，不做通用词频统计（误报会耗掉检查的信誉）。
+SECTION_WORD_PATTERNS = (
+    ("模块", re.compile(r"模块")),
+    ("板块", re.compile(r"板块")),
+    ("第X部分", re.compile(r"第[一二三四五六七八九十百\d]+\s*部分")),
+    ("章节", re.compile(r"章节")),
+    ("品类节", re.compile(r"品类节")),
+)
 
 
 def display_len(text):
@@ -64,6 +98,181 @@ def read_widths_from_xml(path):
     return result
 
 
+def _header_column(sheet, name):
+    """表头（第 1 行）里名为 name 的列号；没有返回 None。"""
+    for cell in sheet[1]:
+        if isinstance(cell.value, str) and cell.value.strip() == name:
+            return cell.column
+    return None
+
+
+def _q_cells(sheet):
+    """整格恰好是 Qn 的格子：[(行号, n)]。
+
+    纵向合并后题号只出现在题目首行，所以这里每道题只贡献一个格子。
+    """
+    result = []
+    for row in sheet.iter_rows():
+        for c in row:
+            if isinstance(c.value, str):
+                m = re.fullmatch(r"Q(\d+)", c.value.strip())
+                if m:
+                    result.append((c.row, int(m.group(1))))
+    return result
+
+
+def _iter_text_cells(sheet, skip_cols=()):
+    """第 2 行起、跳过指定列的非空文本格。"""
+    for row in sheet.iter_rows(min_row=2):
+        for c in row:
+            if c.column in skip_cols:
+                continue
+            if isinstance(c.value, str) and c.value.strip():
+                yield c
+
+
+def _section_rows(sheet, qno_col):
+    """survey 表的 section 行：A 列有值、题号列为空的行。
+
+    prose 行 A 列为空、题目行题号列有值，都不会命中。
+    """
+    rows = []
+    for row in sheet.iter_rows(min_row=2):
+        cells = {c.column: c.value for c in row}
+        a, b = cells.get(1), cells.get(qno_col)
+        if isinstance(a, str) and a.strip() and not (isinstance(b, str) and b.strip()):
+            rows.append(row[0].row)
+    return rows
+
+
+def _check_question_numbers(workbook, problems):
+    """题号完整性：Q1-Qn 连续无缺失、无重复（都是 error）。
+
+    2026-09 起题号统一用 `Q1` 式（问卷表与大纲表一致），
+    不再用「题 1」——兼容检查仍保留，命中才报。
+
+    重复检查的依据：纵向合并后题号只在题目首行的格子里，
+    同一题号出现两次，意味着真的有两道题同号
+    （历史事故：中文问卷里两道题都曾是 Q4）。
+    """
+    for sheet in workbook.worksheets:
+        counts, coords = Counter(), {}
+        for row in sheet.iter_rows():
+            for c in row:
+                if isinstance(c.value, str):
+                    m = re.fullmatch(r"Q(\d+)", c.value.strip())
+                    if m:
+                        v = "Q" + m.group(1)
+                        counts[v] += 1
+                        coords.setdefault(v, []).append(c.coordinate)
+        if counts:
+            qnos = sorted(int(v[1:]) for v in counts)
+            missing = [n for n in range(1, qnos[-1] + 1) if n not in qnos]
+            if missing:
+                problems.append(("error", sheet.title, "-", "题号缺失",
+                                 "Q" + "、Q".join(map(str, missing))))
+            for v in sorted(counts):
+                if counts[v] > 1:
+                    problems.append(("error", sheet.title,
+                                     "、".join(coords[v]), "题号重复",
+                                     f"{v} 出现了 {counts[v]} 次"))
+
+        # 旧式「题 N」：仅当文件里真的用了这种写法时才检查
+        tnos = set()
+        for row in sheet.iter_rows():
+            for c in row:
+                if isinstance(c.value, str):
+                    m = re.fullmatch(r"题\s*(\d+)", c.value.strip())
+                    if m:
+                        tnos.add(int(m.group(1)))
+        if tnos:
+            missing = [n for n in range(1, max(tnos) + 1) if n not in tnos]
+            if missing:
+                problems.append(("error", sheet.title, "-", "题号缺失",
+                                 "题 " + "、题 ".join(map(str, missing))))
+
+
+def _check_logic(sheet, problems):
+    """「问卷逻辑」列：跳转目标存在性（error）与末板块写法（warning）。
+
+    只做这两项（2026-09-10 与用户议定）。「同一题的多个跳转造成
+    不可达题」的图遍历检查刻意不做——某题只能经特定路径到达，
+    往往是设计意图，宁漏勿误。
+    """
+    logic_col = _header_column(sheet, "问卷逻辑")
+    if logic_col is None:
+        return
+    qno_col = _header_column(sheet, "题号")
+    qnos = {n for _, n in _q_cells(sheet)}
+
+    logic_cells = []
+    for row in sheet.iter_rows(min_row=2):
+        for c in row:
+            if c.column == logic_col and isinstance(c.value, str) and c.value.strip():
+                logic_cells.append((c.row, c.value))
+
+    # 1) 跳转目标存在性：写了「跳转到 Qn」而本表没有 Qn
+    for r, text in logic_cells:
+        for target in JUMP_RE.findall(text):
+            if int(target) not in qnos:
+                coord = f"{get_column_letter(logic_col)}{r}"
+                problems.append(("error", sheet.title, coord, "跳转目标不存在",
+                                 f"写了跳转到 Q{target}，但本表没有 Q{target}"))
+
+    # 2) 末板块写法：最后一个含题目的 section 区段里，
+    #    跳过项应写「本模块结束」，而不是指向别处的跳转
+    if qno_col is None:
+        return
+    sections = _section_rows(sheet, qno_col)
+    qno_rows = [r for r, _ in _q_cells(sheet)]
+    if not sections or not qno_rows:
+        return
+    bounds = sections + [sheet.max_row + 1]
+    last = None
+    for i in range(len(sections)):
+        if any(bounds[i] <= r < bounds[i + 1] for r in qno_rows):
+            last = i
+    if last is None:
+        return
+    seg_start, seg_end = bounds[last], bounds[last + 1]
+    for r, text in logic_cells:
+        if seg_start <= r < seg_end and "跳" in text and "本模块结束" not in text:
+            coord = f"{get_column_letter(logic_col)}{r}"
+            problems.append(("warning", sheet.title, coord, "末板块写法",
+                             "末板块的跳过项建议写「本模块结束」"))
+
+
+def _check_internal_keywords(sheet, problems):
+    """删减清单的关键词扫描（warning）。
+
+    只提示，不自动删——命中平台名、内部标注等词，说明可能有
+    该删而未删的内部内容，最终由人判断。
+    """
+    logic_col = _header_column(sheet, "问卷逻辑")
+    for c in _iter_text_cells(sheet, skip_cols=(logic_col,)):
+        hits = [kw for kw in INTERNAL_KEYWORDS if kw in c.value]
+        if hits:
+            problems.append(("warning", sheet.title, c.coordinate, "疑似内部内容",
+                             "、".join(hits) + "（按删减清单判断是否该删）"))
+
+
+def _check_naming(sheet, problems):
+    """同一层级称呼混用（warning）：模块 / 板块 / 第X部分 / 章节 / 品类节。
+
+    K3P 踩坑：「模块」「板块」「品类节」「第 X 部分」混用，
+    读者要自己判断是不是同一层。
+    """
+    logic_col = _header_column(sheet, "问卷逻辑")
+    found = {}
+    for c in _iter_text_cells(sheet, skip_cols=(logic_col,)):
+        for label, pattern in SECTION_WORD_PATTERNS:
+            if label not in found and pattern.search(c.value):
+                found[label] = c.coordinate
+    if len(found) >= 2:
+        detail = "、".join(f"{label}（{coord}）" for label, coord in found.items())
+        problems.append(("warning", sheet.title, "-", "层级称呼混用", detail))
+
+
 def check(path):
     widths_by_sheet = read_widths_from_xml(path)
     workbook = openpyxl.load_workbook(path)
@@ -90,7 +299,7 @@ def check(path):
                 a, b = ranges[i], ranges[j]
                 if (a.min_row <= b.max_row and b.min_row <= a.max_row
                         and a.min_col <= b.max_col and b.min_col <= a.max_col):
-                    problems.append((sheet.title, str(a), "合并重叠", str(b)))
+                    problems.append(("error", sheet.title, str(a), "合并重叠", str(b)))
 
         # 逐格检查
         for row in sheet.iter_rows():
@@ -109,15 +318,16 @@ def check(path):
                             for seg in cell.value.split("\n"))
                 needed = lines * LINE_HEIGHT
                 if needed > height + TOLERANCE:
-                    problems.append((sheet.title, cell.coordinate, "行高不足",
+                    problems.append(("error", sheet.title, cell.coordinate, "行高不足",
                                      f"需要{needed:.0f} 实际{height:.0f} 共{lines}行"))
                 if "**" in cell.value:
-                    problems.append((sheet.title, cell.coordinate, "Markdown残留", "**"))
+                    problems.append(("error", sheet.title, cell.coordinate,
+                                     "Markdown残留", "**"))
 
         if not sheet.freeze_panes:
-            problems.append((sheet.title, "-", "未冻结首行", ""))
+            problems.append(("error", sheet.title, "-", "未冻结首行", ""))
         if sheet.sheet_view.showGridLines:
-            problems.append((sheet.title, "-", "网格线未关闭", ""))
+            problems.append(("error", sheet.title, "-", "网格线未关闭", ""))
 
         # 字体检查：英文列应为 Aptos，中文列应为微软雅黑
         # 注意：全角标点（如 ｜）不算中文内容，避免误报
@@ -139,47 +349,30 @@ def check(path):
                     continue
                 cjk_ratio = sum(1 for ch in chars if is_cjk(ch)) / len(chars)
                 if cjk_ratio > 0.2 and name and "Aptos" in name:
-                    problems.append((sheet.title, cell.coordinate, "中文字体异常",
+                    problems.append(("error", sheet.title, cell.coordinate, "中文字体异常",
                                      f"应为微软雅黑，实际 {name}"))
 
         # 打印设置检查
         if sheet.page_setup.orientation != "landscape":
-            problems.append((sheet.title, "-", "未设横向打印", ""))
+            problems.append(("error", sheet.title, "-", "未设横向打印", ""))
         if not sheet.print_title_rows:
-            problems.append((sheet.title, "-", "未设重复表头", ""))
+            problems.append(("error", sheet.title, "-", "未设重复表头", ""))
+
+        # 内容层面的检查（2026-09-10 新增）
+        _check_logic(sheet, problems)
+        _check_internal_keywords(sheet, problems)
+        _check_naming(sheet, problems)
 
     _check_question_numbers(workbook, problems)
     return workbook, problems
 
 
-def _check_question_numbers(workbook, problems):
-    """检查题号完整性：Q1-Qn 连续，无缺失无重复。
-
-    2026-09 起题号统一用 `Q1` 式（问卷表与大纲表一致），
-    不再用「题 1」——兼容检查仍保留，命中才报。
-    """
-    import re
-
-    for sheet in workbook.worksheets:
-        values = [str(c.value) for row in sheet.iter_rows()
-                  for c in row if c.value not in (None, "")]
-
-        qnos = sorted({int(m) for v in values
-                       for m in re.findall(r"^Q(\d+)$", v.strip())})
-        if qnos:
-            missing = [n for n in range(1, max(qnos) + 1) if n not in qnos]
-            if missing:
-                problems.append((sheet.title, "-", "题号缺失",
-                                 "Q" + "、Q".join(map(str, missing))))
-
-        # 旧式「题 N」：仅当文件里真的用了这种写法时才检查
-        tnos = sorted({int(m) for v in values
-                       for m in re.findall(r"^题\s*(\d+)$", v.strip())})
-        if tnos:
-            missing = [n for n in range(1, max(tnos) + 1) if n not in tnos]
-            if missing:
-                problems.append((sheet.title, "-", "题号缺失",
-                                 "题 " + "、题 ".join(map(str, missing))))
+def _print_problems(problems, title):
+    print(title)
+    for level, sheet_name, coord, kind, detail in problems[:60]:
+        print(f"  [{sheet_name}] {coord} {kind} {detail}")
+    if len(problems) > 60:
+        print(f"  ... 另有 {len(problems) - 60} 项")
 
 
 def main():
@@ -198,12 +391,14 @@ def main():
         print("校验通过：无裁切、无合并重叠、无 Markdown 残留。")
         return
 
-    print(f"发现 {len(problems)} 个问题：")
-    for sheet, coord, kind, detail in problems[:60]:
-        print(f"  [{sheet}] {coord} {kind} {detail}")
-    if len(problems) > 60:
-        print(f"  ... 另有 {len(problems) - 60} 项")
-    sys.exit(2)
+    errors = [p for p in problems if p[0] == "error"]
+    warnings = [p for p in problems if p[0] == "warning"]
+    if errors:
+        _print_problems(errors, f"错误 {len(errors)} 项（必须修复）：")
+    if warnings:
+        _print_problems(warnings, f"提醒 {len(warnings)} 项（疑似问题，由人裁决）：")
+    # 只有 error 才影响退出码；warning 属于「报出来、人来修」
+    sys.exit(2 if errors else 0)
 
 
 if __name__ == "__main__":

@@ -721,9 +721,22 @@ def main():
         return
     _, problems = validator.check(output)
     if problems:
-        print(f"\n校验发现 {len(problems)} 个问题：")
-        for sheet_name, coord, kind, detail in problems[:60]:
-            print(f"  [{sheet_name}] {coord} {kind} {detail}")
+        # 问题分两级：error 必须修复；warning 是疑似问题，由人裁决。
+        # 两类都只打印，不挡生成——保持「报出来、人来修」的工作流。
+        errors = [p for p in problems if p[0] == "error"]
+        warnings = [p for p in problems if p[0] == "warning"]
+        if errors:
+            print(f"\n校验发现 {len(errors)} 项错误（必须修复）：")
+            for _, sheet_name, coord, kind, detail in errors[:60]:
+                print(f"  [{sheet_name}] {coord} {kind} {detail}")
+            if len(errors) > 60:
+                print(f"  ... 另有 {len(errors) - 60} 项")
+        if warnings:
+            print(f"\n校验提醒 {len(warnings)} 项（疑似问题，由人裁决）：")
+            for _, sheet_name, coord, kind, detail in warnings[:60]:
+                print(f"  [{sheet_name}] {coord} {kind} {detail}")
+            if len(warnings) > 60:
+                print(f"  ... 另有 {len(warnings) - 60} 项")
     else:
         print("\n校验通过：无裁切、无合并重叠、无 Markdown 残留。")
 
