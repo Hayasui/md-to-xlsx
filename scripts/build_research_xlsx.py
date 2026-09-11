@@ -647,12 +647,17 @@ def build_outline(workbook, spec, outline_index):
 
     page_first = None
     block_first = None
+    option_index = 0
 
     def close_block():
-        """把当前题目的「目的 / 题号 / 题型」三列纵向合并。"""
+        """把当前题目的「目的 / 题型」两列纵向合并。
+
+        题号列不合并——选项行上要写该题的选项序号，合并了就只剩首行有值
+        （与两张问卷表同规）。
+        """
         nonlocal block_first
         if block_first is not None and sheet.row > block_first:
-            for name in ("目的", "题号", "题型"):
+            for name in ("目的", "题型"):
                 if name in columns:
                     sheet.merge_down(columns.index(name) + 1, block_first, sheet.row)
         block_first = None
@@ -686,11 +691,19 @@ def build_outline(workbook, spec, outline_index):
             sheet.add(pad([("", "module", 1), (purpose, "key", 1), (qno, "label", 1),
                            (qtype, "label", 1), (cn, "body", 1), (en, "body", 1)]))
             block_first = sheet.row
+            option_index = 0
             sheet.mark_block_top(sheet.row)
         elif kind in ("scale", "opt"):
             _, cn, en = item
             style = "scale" if kind == "scale" else "body"
-            sheet.add(pad([("", "module", 1), ("", "body", 1), ("", "body", 1),
+            # opt 行是选项，在题号列上写该题的选项序号（1、2、3……）；
+            # scale 行是量表标签（「1 = 很不同意 ｜ 5 = 很同意」），是图例不是选项，不编号。
+            if kind == "opt":
+                option_index += 1
+                qno_cell = (str(option_index), "label", 1)
+            else:
+                qno_cell = ("", "body", 1)
+            sheet.add(pad([("", "module", 1), ("", "body", 1), qno_cell,
                            ("", "body", 1), (cn, style, 1), (en, style, 1)]))
         elif kind in ("fu", "obs"):
             _, cn = item
