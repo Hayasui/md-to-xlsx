@@ -131,22 +131,30 @@ def _iter_text_cells(sheet, skip_cols=()):
                 yield c
 
 
-def _section_rows(sheet, qno_col):
-    """survey 表的 section 行：A 列有值、题号列为空的行。
+def _section_rows(sheet):
+    """survey 表的分节横条行：整行只有 A 列有值。
 
-    prose 行 A 列为空、题目行题号列有值，都不会命中。
+    2026-09-11 之前这份表最左列是「模块」，横条行的判定是「A 列有值、题号列为空」；
+    现在最左列是「目的」，prose 行的目的格里有「板块引导语」这类标签，
+    只看题号列会把引导语行误判成横条，所以改成「其余各列全空」才算横条。
     """
     rows = []
     for row in sheet.iter_rows(min_row=2):
         cells = {c.column: c.value for c in row}
-        a, b = cells.get(1), cells.get(qno_col)
-        if isinstance(a, str) and a.strip() and not (isinstance(b, str) and b.strip()):
-            rows.append(row[0].row)
+        a = cells.get(1)
+        if not (isinstance(a, str) and a.strip()):
+            continue
+        others = [v for col, v in cells.items()
+                  if col != 1 and isinstance(v, str) and v.strip()]
+        if others:
+            continue
+        rows.append(row[0].row)
     return rows
 
 
 def _check_question_numbers(workbook, problems):
-    """题号完整性：Q1-Qn 连续无缺失、无重复（都是 error）。
+    """题号完整性：区间内连续无缺失、无重复（都是 error）。
+    首题不是 Q1 只报 warning——两版大纲本来就允许起点不同。
 
     2026-09 起题号统一用 `Q1` 式（问卷表与大纲表一致），
     不再用「题 1」——兼容检查仍保留，命中才报。
@@ -167,10 +175,18 @@ def _check_question_numbers(workbook, problems):
                         coords.setdefault(v, []).append(c.coordinate)
         if counts:
             qnos = sorted(int(v[1:]) for v in counts)
-            missing = [n for n in range(1, qnos[-1] + 1) if n not in qnos]
+            # 缺号一律报 error；但「首题不是 Q1」单独降成 warning——
+            # 有主持人版大纲从 Q2 起是既定的骨架约定（无人版的 Q1 是下载导航，
+            # 有人版由试玩说明承载），报 error 会把这条真实设计判成故障。
+            # 其余缺口仍按 error，真正的断号照旧挡得住。
+            missing = [n for n in range(min(qnos), qnos[-1] + 1) if n not in qnos]
             if missing:
                 problems.append(("error", sheet.title, "-", "题号缺失",
                                  "Q" + "、Q".join(map(str, missing))))
+            if min(qnos) != 1:
+                problems.append(("warning", sheet.title, "-", "首题不是 Q1",
+                                 f"本表从 Q{min(qnos)} 起；若是有意为之（如"
+                                 f"有主持人版从 Q2 与无人版对齐）可放行"))
             for v in sorted(counts):
                 if counts[v] > 1:
                     problems.append(("error", sheet.title,
@@ -223,7 +239,7 @@ def _check_logic(sheet, problems):
     #    跳过项应写「本模块结束」，而不是指向别处的跳转
     if qno_col is None:
         return
-    sections = _section_rows(sheet, qno_col)
+    sections = _section_rows(sheet)
     qno_rows = [r for r, _ in _q_cells(sheet)]
     if not sections or not qno_rows:
         return

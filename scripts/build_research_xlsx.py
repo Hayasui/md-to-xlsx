@@ -56,7 +56,10 @@ BORDER = Border(left=_side, right=_side, top=_side, bottom=_side)
 LINE_HEIGHT = 15.2      # 每行文字占用的磅值
 ROW_PADDING = 5         # 单元格上下留白
 ROW_MIN = 24            # 最小行高
-ROW_MAX = 300           # 最大行高（防止极端长文撑爆）
+ROW_MAX = 405           # 最大行高（Excel 单行上限为 409.5 磅，留一点余量）
+                        # 曾经是 300，但校验器按内容实算所需行高，两者对长单元格
+                        # 会互相打架——一道题里放两版话术就能需要 390 磅。
+                        # 上限的作用只是防极端长文撑爆，不该低于表格本身能表达的限度。
 BASE_SIZE = 10          # 正文字号
 
 # 打印设置（留档、导出 PDF 时生效）
@@ -241,19 +244,20 @@ COLUMNS_8 = COLUMNS_6 + ("追问方向", "观察记录点")
 # 问卷的两种列规格。末列统一叫「问卷逻辑」，记录题目之间的跳转与因果关系：
 # 甄别问卷里写的是终止与通过，满意度问卷里写的是跳转、互斥与需填文本。
 # 列名统一，语义由每份表自己的内容决定。
-# 最左侧是「模块」列（2026-09-11 起）：记录这道题属于哪一组，值取自内容区的
-# ("section", "模块名") 行，纵向按题合并。读表的人不必自己推这道题在哪一节里。
+# 最左侧是「目的」列（2026-09-11 起）：写这道题要拿什么数，取自 q 行最后一个
+# 元素，纵向按题合并。模块不进这一列——`section` 行出的分节横条管模块，
+# 两处都写模块名，同一个名字会出现两遍（这件事返工过一次，别再翻回去）。
 #
 # 「题号」列在选项行上补该题的选项序号（1、2、3……），题目首行仍是 Qn。
 # 序号只出现在选项行，所以该列不做纵向合并——合并了就只剩首行有值。
-COLUMNS_SURVEY = ("模块", "题型", "题号", "中文", "English", "问卷逻辑")
-COLUMNS_SURVEY_CN = ("模块", "题型", "题号", "中文", "问卷逻辑")
+COLUMNS_SURVEY = ("目的", "题型", "题号", "中文", "English", "问卷逻辑")
+COLUMNS_SURVEY_CN = ("目的", "题型", "题号", "中文", "问卷逻辑")
 
 # 各类型的列宽。大纲按列数取不同预设（八列时收窄中文列，控制横向总宽）。
 WIDTHS = {
     "needs": (17, 9, 112),
-    "survey": (17, 11, 8, 54, 54, 27),
-    "survey_cn": (17, 11, 8, 80, 36),
+    "survey": (22, 11, 8, 54, 54, 27),
+    "survey_cn": (22, 11, 8, 80, 36),
     "outline": {
         6: (19, 21, 8, 14, 50, 50),
         8: (19, 21, 8, 12, 44, 44, 36, 36),
@@ -309,10 +313,13 @@ NEEDS = [
 #   prose   → ("prose", [(中文, 英文), ...])
 #             开场或结束语。每一对被拆成一行；
 #             若要把整段文字放在同一个单元格里，写成单个元组、用 \n 在字符串内换行。
-#   q       → ("q", 题型, 题号, 中文题干, 英文题干, 问卷逻辑, [(中文选项, 英文选项, 逻辑), ...])
+#   q       → ("q", 题型, 题号, 中文题干, 英文题干, 问卷逻辑, [(中文选项, 英文选项, 逻辑), ...],
+#                "这道题的目的")
 #             题目行的「问卷逻辑」是整题的默认值；选项行的逻辑写在每个选项上。
 #             逻辑留空 = 无特殊行为；甄别问卷里写 "终止" 的项，脚本按红色加粗渲染。
 #             逻辑列照 md 写，不自行改成"机筛"或别的措辞。
+#             第七个元素（选项集）之后的第八个元素可选，写这道题的「目的」，
+#             落到最左列并按题纵向合并——与 SURVEY_CN 的写法一致。
 SURVEY = [
     ("section", "开场说明"),
     ("prose", [
@@ -323,7 +330,8 @@ SURVEY = [
      "……", "……",
      "",
      [("……", "……", ""),
-      ("……", "……", "终止")]),
+      ("……", "……", "终止")],
+     "……"),
     ("section", "结束语"),
     ("prose", [
         ("……\n……", "……\n……"),
@@ -479,10 +487,10 @@ def build_needs(workbook, spec):
 
 
 def check_modules(spec):
-    """问卷必须分模块；一个 section 行都没有就报错，把题目列出来请人先分类。
+    """问卷必须分组；一个 section 行都没有就报错，把题目列出来请人先分类。
 
-    模块列的值来自 ("section", "模块名") 行。整张表一个 section 都没有，
-    这一列就会是空的，需求方拿到表第一句就问「这列为什么空着」。
+    分节横条的粒度来自 ("section", "模块名") 行。整张表一个 section 都没有，
+    题目就是一长条没有分节的流水，需求方与配置问卷的人都得自己去数题。
     与其生成一份要返工的表，不如当场停下来让人先分类。
 
     单模块也是合法的（写一个 section 行即可），这里只拦「完全没分」。
@@ -500,7 +508,7 @@ def check_modules(spec):
         '  下面按现有顺序列出 %d 道题，供切分参考：' % len(qs),
     ]
     lines += ["    " + q[:26] for q in qs]
-    lines.append('  分好之后重跑，模块列的值就是这些 section 的名字。')
+    lines.append('  分好之后重跑，每一组前面就会多出一条分节横条。')
     raise ValueError("\n".join(lines))
 
 
@@ -515,19 +523,29 @@ def build_survey(workbook, spec):
     sheet = Sheet(workbook, spec["name"], resolve_widths(spec),
                   resolve_tab_color(spec, 0), en_columns=(5,))
     sheet.add([(name, "header", 1) for name in columns])
-    module = ""
     for item in spec["content"]:
         kind = item[0]
         if kind == "section":
-            module = item[1]
-            sheet.add([(module, "section", len(columns))])
+            # 分节横条（2026-09-11 恢复）：模块只在这里出现一次，最左列留给「目的」。
+            sheet.add([(item[1], "section", len(columns))])
         elif kind == "prose":
+            # prose 行可带第三个元素，作为「目的」格里的标签（「开场说明」「板块引导语」）
+            label = item[2] if len(item) > 2 else ""
             for cn, en in item[1]:
-                sheet.add(blank(3) + [(cn, "body", 1), (en, "body", 1), ("", "body", 1)])
+                sheet.add([(label, "key", 1), ("", "body", 1), ("", "body", 1),
+                           (cn, "body", 1), (en, "body", 1), ("", "body", 1)])
         elif kind == "q":
-            _, qtype, qno, stem_cn, stem_en, logic, options = item
+            # 用索引取值，不用解包——q 行的元素个数是可变的（第七个是选项集，
+            # 第八个是这道题的「目的」）。写成定长解包的话，带「目的」的行会当场
+            # 抛 "too many values to unpack"，而目的列本该是这一版的新增项。
+            qtype, qno = item[1], item[2]
+            stem_cn, stem_en = item[3], item[4]
+            logic = item[5] if len(item) > 5 else ""
+            options = item[6] if len(item) > 6 else []
+            # 可选的第八个元素：这道题的「目的」，写进最左列
+            purpose = item[7] if len(item) > 7 else ""
             first = sheet.row + 1
-            sheet.add([(module, "module", 1), (qtype, "label", 1), (qno, "label", 1),
+            sheet.add([(purpose, "key", 1), (qtype, "label", 1), (qno, "label", 1),
                        (stem_cn, "body", 1), (stem_en, "body", 1), (logic, "judge", 1)])
             for index, (cn, en, mark) in enumerate(options, 1):
                 sheet.add(blank(2) + [(str(index), "label", 1), (cn, "body", 1),
@@ -556,10 +574,9 @@ def build_survey_cn(workbook, spec):
                   resolve_tab_color(spec, 0))
     sheet.add([(name, "header", 1) for name in columns])
     block_first = None
-    module = ""
 
     def close_block():
-        """把当前题目的「模块 / 题型」两列纵向合并。
+        """把当前题目的「目的 / 题型」两列纵向合并。
 
         题号列不合并——选项行上要写该题的选项序号，合并了就只剩首行有值。
         """
@@ -572,20 +589,25 @@ def build_survey_cn(workbook, spec):
     for item in spec["content"]:
         kind = item[0]
         if kind == "section":
+            # 分节横条（2026-09-11 恢复）：模块只在这里出现一次，最左列留给「目的」。
             close_block()
-            module = item[1]
-            sheet.add([(module, "section", len(columns))])
+            sheet.add([(item[1], "section", len(columns))])
         elif kind == "prose":
             close_block()
+            # prose 行可带第三个元素，作为「目的」格里的标签（「开场说明」「板块引导语」）
+            label = item[2] if len(item) > 2 else ""
             for paragraph in item[1]:
-                sheet.add(blank(3) + [(paragraph, "body", 1), ("", "body", 1)])
+                sheet.add([(label, "key", 1), ("", "body", 1), ("", "body", 1),
+                           (paragraph, "body", 1), ("", "body", 1)])
         elif kind == "q":
             close_block()
             qtype, qno, stem, options = item[1], item[2], item[3], item[4]
             # 可选的第六个元素：整题的问卷逻辑（门槛、跳转目标）。
             # 不写就留空，逻辑只落在触发它的选项行上。
             qlogic = item[5] if len(item) > 5 else ""
-            sheet.add([(module, "module", 1), (qtype, "label", 1), (qno, "label", 1),
+            # 可选的第七个元素：这道题的「目的」，写进最左列。
+            purpose = item[6] if len(item) > 6 else ""
+            sheet.add([(purpose, "key", 1), (qtype, "label", 1), (qno, "label", 1),
                        (stem, "body", 1), (qlogic, "judge", 1)])
             block_first = sheet.row
             sheet.mark_block_top(sheet.row)
