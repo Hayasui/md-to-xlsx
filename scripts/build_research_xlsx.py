@@ -241,14 +241,19 @@ COLUMNS_8 = COLUMNS_6 + ("追问方向", "观察记录点")
 # 问卷的两种列规格。末列统一叫「问卷逻辑」，记录题目之间的跳转与因果关系：
 # 甄别问卷里写的是终止与通过，满意度问卷里写的是跳转、互斥与需填文本。
 # 列名统一，语义由每份表自己的内容决定。
-COLUMNS_SURVEY = ("题型", "题号", "中文", "English", "问卷逻辑")
-COLUMNS_SURVEY_CN = ("题型", "题号", "中文", "问卷逻辑")
+# 最左侧是「模块」列（2026-09-11 起）：记录这道题属于哪一组，值取自内容区的
+# ("section", "模块名") 行，纵向按题合并。读表的人不必自己推这道题在哪一节里。
+#
+# 「题号」列在选项行上补该题的选项序号（1、2、3……），题目首行仍是 Qn。
+# 序号只出现在选项行，所以该列不做纵向合并——合并了就只剩首行有值。
+COLUMNS_SURVEY = ("模块", "题型", "题号", "中文", "English", "问卷逻辑")
+COLUMNS_SURVEY_CN = ("模块", "题型", "题号", "中文", "问卷逻辑")
 
 # 各类型的列宽。大纲按列数取不同预设（八列时收窄中文列，控制横向总宽）。
 WIDTHS = {
     "needs": (17, 9, 112),
-    "survey": (11, 8, 54, 54, 27),
-    "survey_cn": (11, 8, 80, 36),
+    "survey": (17, 11, 8, 54, 54, 27),
+    "survey_cn": (17, 11, 8, 80, 36),
     "outline": {
         6: (19, 21, 8, 14, 50, 50),
         8: (19, 21, 8, 12, 44, 44, 36, 36),
@@ -473,30 +478,60 @@ def build_needs(workbook, spec):
     sheet.finish("A2")
 
 
+def check_modules(spec):
+    """问卷必须分模块；一个 section 行都没有就报错，把题目列出来请人先分类。
+
+    模块列的值来自 ("section", "模块名") 行。整张表一个 section 都没有，
+    这一列就会是空的，需求方拿到表第一句就问「这列为什么空着」。
+    与其生成一份要返工的表，不如当场停下来让人先分类。
+
+    单模块也是合法的（写一个 section 行即可），这里只拦「完全没分」。
+    """
+    content = spec["content"]
+    if any(item[0] == "section" for item in content):
+        return
+    qs = ["%s %s" % (item[2], item[3]) for item in content if item[0] == "q"]
+    lines = [
+        '问卷「%s」没有模块划分，先分类再生成。' % spec["name"],
+        '  做法：先在 md 里按题目性质分组，再照它写进内容区的 ("section", "模块名") 行。',
+        '  模块名沿用 md 里的段落名即可（带「一、二、」这类序号也行，序号能看出顺序）。',
+        '  若 md 里本来就没有分块，就按题目性质切，例如「基础信息收集」「品类认知」',
+        '  「付费与留存」——取功能性的说法，别用「第一部分」这种离开本卷就不知所指的名字。',
+        '  下面按现有顺序列出 %d 道题，供切分参考：' % len(qs),
+    ]
+    lines += ["    " + q[:26] for q in qs]
+    lines.append('  分好之后重跑，模块列的值就是这些 section 的名字。')
+    raise ValueError("\n".join(lines))
+
+
 def build_survey(workbook, spec):
-    """问卷表（中英并列）：题型 | 题号 | 中文 | English | 问卷逻辑。"""
+    """问卷表（中英并列）：模块 | 题型 | 题号 | 中文 | English | 问卷逻辑。"""
     columns = spec.get("columns", COLUMNS_SURVEY)
     if columns != COLUMNS_SURVEY:
         raise ValueError(
             f'问卷「{spec["name"]}」的 columns 为 {columns}；'
             f'中英并列问卷只能用 COLUMNS_SURVEY，纯中文请把 type 写成 survey_cn。')
+    check_modules(spec)
     sheet = Sheet(workbook, spec["name"], resolve_widths(spec),
-                  resolve_tab_color(spec, 0), en_columns=(4,))
+                  resolve_tab_color(spec, 0), en_columns=(5,))
     sheet.add([(name, "header", 1) for name in columns])
+    module = ""
     for item in spec["content"]:
         kind = item[0]
         if kind == "section":
-            sheet.add([(item[1], "section", 5)])
+            module = item[1]
+            sheet.add([(module, "section", len(columns))])
         elif kind == "prose":
             for cn, en in item[1]:
-                sheet.add(blank(2) + [(cn, "body", 1), (en, "body", 1), ("", "body", 1)])
+                sheet.add(blank(3) + [(cn, "body", 1), (en, "body", 1), ("", "body", 1)])
         elif kind == "q":
             _, qtype, qno, stem_cn, stem_en, logic, options = item
             first = sheet.row + 1
-            sheet.add([(qtype, "label", 1), (qno, "label", 1),
+            sheet.add([(module, "module", 1), (qtype, "label", 1), (qno, "label", 1),
                        (stem_cn, "body", 1), (stem_en, "body", 1), (logic, "judge", 1)])
-            for cn, en, mark in options:
-                sheet.add(blank(2) + [(cn, "body", 1), (en, "body", 1),
+            for index, (cn, en, mark) in enumerate(options, 1):
+                sheet.add(blank(2) + [(str(index), "label", 1), (cn, "body", 1),
+                                      (en, "body", 1),
                                       (mark, "stop" if mark else "body", 1)])
             sheet.merge_down(1, first, sheet.row)
             sheet.merge_down(2, first, sheet.row)
@@ -507,7 +542,7 @@ def build_survey(workbook, spec):
 
 
 def build_survey_cn(workbook, spec):
-    """问卷表（纯中文）：题型 | 题号 | 中文 | 问卷逻辑。
+    """问卷表（纯中文）：模块 | 题型 | 题号 | 中文 | 问卷逻辑。
 
     与中英并列版的差别只有一处：没有 English 列，行里也不写英文。
     """
@@ -516,13 +551,18 @@ def build_survey_cn(workbook, spec):
         raise ValueError(
             f'纯中文问卷「{spec["name"]}」的 columns 为 {columns}；'
             f'应为 COLUMNS_SURVEY_CN。')
+    check_modules(spec)
     sheet = Sheet(workbook, spec["name"], resolve_widths(spec),
                   resolve_tab_color(spec, 0))
     sheet.add([(name, "header", 1) for name in columns])
     block_first = None
+    module = ""
 
     def close_block():
-        """把当前题目的「题型 / 题号」两列纵向合并。"""
+        """把当前题目的「模块 / 题型」两列纵向合并。
+
+        题号列不合并——选项行上要写该题的选项序号，合并了就只剩首行有值。
+        """
         nonlocal block_first
         if block_first is not None and sheet.row > block_first:
             sheet.merge_down(1, block_first, sheet.row)
@@ -533,23 +573,24 @@ def build_survey_cn(workbook, spec):
         kind = item[0]
         if kind == "section":
             close_block()
-            sheet.add([(item[1], "section", len(columns))])
+            module = item[1]
+            sheet.add([(module, "section", len(columns))])
         elif kind == "prose":
             close_block()
             for paragraph in item[1]:
-                sheet.add(blank(2) + [(paragraph, "body", 1), ("", "body", 1)])
+                sheet.add(blank(3) + [(paragraph, "body", 1), ("", "body", 1)])
         elif kind == "q":
             close_block()
             qtype, qno, stem, options = item[1], item[2], item[3], item[4]
             # 可选的第六个元素：整题的问卷逻辑（门槛、跳转目标）。
             # 不写就留空，逻辑只落在触发它的选项行上。
             qlogic = item[5] if len(item) > 5 else ""
-            sheet.add([(qtype, "label", 1), (qno, "label", 1),
+            sheet.add([(module, "module", 1), (qtype, "label", 1), (qno, "label", 1),
                        (stem, "body", 1), (qlogic, "judge", 1)])
             block_first = sheet.row
             sheet.mark_block_top(sheet.row)
-            for option, logic in options:
-                sheet.add(blank(2) + [(option, "body", 1),
+            for index, (option, logic) in enumerate(options, 1):
+                sheet.add(blank(2) + [(str(index), "label", 1), (option, "body", 1),
                                       (logic, "stop" if logic else "body", 1)])
         elif kind == "field":
             if block_first is None:
@@ -557,7 +598,8 @@ def build_survey_cn(workbook, spec):
                     f'纯中文问卷「{spec["name"]}」的 field 行没有可依附的题目；'
                     f'它必须紧跟在某道题之后。')
             _, text, logic = item
-            sheet.add(blank(2) + [(text, "scale", 1), (logic, "judge", 1)])
+            # field 是补充输入行，不是选项，所以题号列留空，不参与序号编排。
+            sheet.add(blank(3) + [(text, "scale", 1), (logic, "judge", 1)])
         else:
             raise ValueError(f"纯中文问卷不认识的类型：{kind}")
     close_block()
