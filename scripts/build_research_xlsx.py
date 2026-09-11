@@ -329,8 +329,10 @@ SURVEY = [
 # 用于中文定稿在先、英文版尚未制作的场景。行格式比 SURVEY 少一处英文：
 #   section → ("section", "分节标题")
 #   prose   → ("prose", ["段落", ...])          每个元素占一行
-#   q       → ("q", 题型, 题号, 题干, [(选项, 逻辑), ...])
+#   q       → ("q", 题型, 题号, 题干, [(选项, 逻辑), ...], "整题门槛")
 #             题型、题号两列在该题所有行上纵向合并
+#             第六个元素可选，写整题的问卷逻辑（如「仅 Q2 勾选『X』者作答」、跳转目标）；
+#             不写就留空，逻辑只落在触发它的选项行上
 #   field   → ("field", "题干附属的输入行", "问卷逻辑")
 #             追加在当前题目之后，与上一题共用题型与题号。
 #             用于「用一句话说说为什么」这类并列在选择题下的补充输入；
@@ -538,9 +540,12 @@ def build_survey_cn(workbook, spec):
                 sheet.add(blank(2) + [(paragraph, "body", 1), ("", "body", 1)])
         elif kind == "q":
             close_block()
-            _, qtype, qno, stem, options = item
+            qtype, qno, stem, options = item[1], item[2], item[3], item[4]
+            # 可选的第六个元素：整题的问卷逻辑（门槛、跳转目标）。
+            # 不写就留空，逻辑只落在触发它的选项行上。
+            qlogic = item[5] if len(item) > 5 else ""
             sheet.add([(qtype, "label", 1), (qno, "label", 1),
-                       (stem, "body", 1), ("", "body", 1)])
+                       (stem, "body", 1), (qlogic, "judge", 1)])
             block_first = sheet.row
             sheet.mark_block_top(sheet.row)
             for option, logic in options:
