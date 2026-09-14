@@ -633,14 +633,15 @@ OUTLINE_UNMODERATED = [
      "你会打几分？",
      "Based on your experience just now, how satisfied are you overall with today's game, "
      "on a scale of 1 to 10 (1 = the lowest, 10 = the highest)? What would you score it?"),
-    ("scale", "1 = 非常不满意 ｜ 10 = 非常满意", "1 = Very unsatisfied ｜ 10 = Extremely satisfied"),
+    # 量表端点的措辞照 sc-to-en/references/survey-wording.md（唯一出处），别在这里另写一套
+    ("scale", "1 = 非常不满意 ｜ 10 = 非常满意", "1 = Very dissatisfied ｜ 10 = Extremely satisfied"),
     ("q", "基准游戏满意度（对照）", "Q9", "打分",
      "再想想过去 3 个月里你选的那款游戏给你的整体感受，也给它打个分，1 分最低，10 分最高。"
      "你会打几分？",
      "Now, thinking about your overall experience over the past 3 months with the game you "
      "selected, how satisfied are you overall with it, on a scale of 1 to 10 (1 = the lowest, "
      "10 = the highest)? What would you score it?"),
-    ("scale", "1 = 非常不满意 ｜ 10 = 非常满意", "1 = Very unsatisfied ｜ 10 = Extremely satisfied"),
+    ("scale", "1 = 非常不满意 ｜ 10 = 非常满意", "1 = Very dissatisfied ｜ 10 = Extremely satisfied"),
     ("q", "继续体验意愿", "Q10", "打分",
      "假设今天不是测试、也没有任何奖励，就凭你刚才的体验——明天你还想继续玩这款游戏的"
      "可能性有多大？1 分代表肯定不会，10 分代表肯定会。你会打几分？",
