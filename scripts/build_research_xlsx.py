@@ -629,6 +629,25 @@ def build_survey_cn(workbook, spec):
 
 
 def build_outline(workbook, spec, outline_index):
+    """访谈大纲。按「题块」组装行，四栏齐头。
+
+    一条题块 = 一条题干行（`q` / `kv` / `sub`，有主持人版里还有充当子问的 `opt` 行）
+    加上跟在它后面的 `fu` / `obs` / `scale` 行。行是这样摊开的：
+
+      · 每条题干行的第一条 `fu` 与第一条 `obs` 落在**题干行本身**，
+        「中文 / English / 追问方向 / 观察记录点」四栏因此从同一行起头；
+      · 同一条题干行下的第二条起，各自另起一行，按序往下排；
+      · 遇到下一条题干行（含作为子问的 `opt` 行），两个游标复位，
+        新题干行重新从第一条起算。
+
+    这样做是为了消掉「追问与记录点比中文/English 低一行」的错位——四栏齐头，
+    横向扫读时一眼能对上，长单元格也不会把追问甩到底部。
+
+    `opt` 行在两个位置出现，含义不同：无主持人版里它是题的选项（题号列写自增序号
+    1、2、3……）；有主持人版里它可以充当一道题的**子问**，此时在行末补第四个元素
+    写死题号列上的标签（如 `("opt", 中文, English, "19-2")`）。给了标签就用标签，
+    没给就照旧自增。
+    """
     columns = spec.get("columns", COLUMNS_6)
     ncols = len(columns)
     widths = resolve_widths(spec)
@@ -638,22 +657,28 @@ def build_outline(workbook, spec, outline_index):
     sheet.add([(name, "header", 1) for name in columns])
 
     # 按列名定位：列没声明却用了对应行类型，就当场报错，不静默丢内容。
-    def col_of(row_kind, label):
-        name = OUTLINE_ROW_COLUMNS.get(row_kind, label)
+    def col_of(row_kind):
+        name = OUTLINE_ROW_COLUMNS[row_kind]
         if name not in columns:
             raise ValueError(
                 f'大纲「{spec["name"]}」用了 "{row_kind}" 行，但 columns 里没有「{name}」列。')
         return columns.index(name) + 1
 
+    def pad(cells):
+        """补足到 ncols 列。"""
+        return cells + [("", "body", 1)] * (ncols - len(cells))
+
+    def blank_row():
+        return [("", "body", 1)] * ncols
+
     page_first = None
     block_first = None
-    option_index = 0
 
     def close_block():
-        """把当前题目的「目的 / 题型」两列纵向合并。
+        """把当前题块的「目的 / 题型」两列纵向合并。
 
-        题号列不合并——选项行上要写该题的选项序号，合并了就只剩首行有值
-        （与两张问卷表同规）。
+        题号列不合并——选项行与子问行上要写序号或子问题号，
+        合并了就只剩首行有值（与两张问卷表同规）。
         """
         nonlocal block_first
         if block_first is not None and sheet.row > block_first:
@@ -662,56 +687,99 @@ def build_outline(workbook, spec, outline_index):
                     sheet.merge_down(columns.index(name) + 1, block_first, sheet.row)
         block_first = None
 
-    def pad(cells):
-        """补足到 ncols 列。"""
-        return cells + [("", "body", 1)] * (ncols - len(cells))
+    content = spec["content"]
+    index = 0
+    total = len(content)
+    while index < total:
+        kind = content[index][0]
 
-    for item in spec["content"]:
-        kind = item[0]
         if kind == "page":
             close_block()
             if page_first is not None:
                 sheet.merge_down(1, page_first, sheet.row)
-            sheet.add([(item[1], "module", 1), (item[2], "section", ncols - 1)],
-                      height=36)
+            sheet.add([(content[index][1], "module", 1),
+                       (content[index][2], "section", ncols - 1)], height=36)
             page_first = sheet.row
-        elif kind == "kv":
-            close_block()
-            _, label, cn, en = item
-            sheet.add(pad([("", "module", 1), (label, "key", 1), ("", "label", 1),
-                           ("", "label", 1), (cn, "body", 1), (en, "body", 1)]))
-        elif kind == "sub":
-            close_block()
-            _, cn, en = item
-            sheet.add(pad([("", "module", 1), ("页面引导语", "key", 1), ("", "label", 1),
-                           ("", "label", 1), (cn, "body", 1), (en, "body", 1)]))
-        elif kind == "q":
-            close_block()
-            _, purpose, qno, qtype, cn, en = item
-            sheet.add(pad([("", "module", 1), (purpose, "key", 1), (qno, "label", 1),
-                           (qtype, "label", 1), (cn, "body", 1), (en, "body", 1)]))
-            block_first = sheet.row
-            option_index = 0
-            sheet.mark_block_top(sheet.row)
-        elif kind in ("scale", "opt"):
-            _, cn, en = item
-            style = "scale" if kind == "scale" else "body"
-            # opt 行是选项，在题号列上写该题的选项序号（1、2、3……）；
-            # scale 行是量表标签（「1 = 很不同意 ｜ 5 = 很同意」），是图例不是选项，不编号。
-            if kind == "opt":
-                option_index += 1
-                qno_cell = (str(option_index), "label", 1)
-            else:
-                qno_cell = ("", "body", 1)
-            sheet.add(pad([("", "module", 1), ("", "body", 1), qno_cell,
-                           ("", "body", 1), (cn, style, 1), (en, style, 1)]))
-        elif kind in ("fu", "obs"):
-            _, cn = item
-            cells = [("", "body", 1)] * ncols
-            cells[col_of(kind, "") - 1] = (cn, "body", 1)
-            sheet.add(cells)
-        else:
+            index += 1
+            continue
+
+        if kind not in ("kv", "sub", "q"):
             raise ValueError(f"访谈大纲不认识的类型：{kind}")
+
+        # 收一个题块：题干行 + 紧跟在它后面的 fu / obs / scale / opt
+        block = [content[index]]
+        index += 1
+        while index < total and content[index][0] in ("fu", "obs", "scale", "opt"):
+            block.append(content[index])
+            index += 1
+
+        close_block()
+        rows = []            # 本块逐行的单元格，先备好再写，行高才算得准
+        stem = None          # 当前题干行的下标，追问与记录点附着于此
+        cursor = {"fu": None, "obs": None}
+        option_index = 0
+
+        def new_stem(cells):
+            """落一条题干行，并把两个游标复位。"""
+            rows.append(cells)
+            nonlocal stem
+            stem = len(rows) - 1
+            cursor["fu"] = cursor["obs"] = None
+
+        for item in block:
+            row_kind = item[0]
+            if row_kind == "q":
+                _, purpose, qno, qtype, cn, en = item
+                new_stem(pad([("", "module", 1), (purpose, "key", 1), (qno, "label", 1),
+                              (qtype, "label", 1), (cn, "body", 1), (en, "body", 1)]))
+                option_index = 0
+            elif row_kind == "kv":
+                _, label, cn, en = item
+                new_stem(pad([("", "module", 1), (label, "key", 1), ("", "label", 1),
+                              ("", "label", 1), (cn, "body", 1), (en, "body", 1)]))
+            elif row_kind == "sub":
+                _, cn, en = item
+                new_stem(pad([("", "module", 1), ("页面引导语", "key", 1),
+                              ("", "label", 1), ("", "label", 1),
+                              (cn, "body", 1), (en, "body", 1)]))
+            elif row_kind == "opt":
+                cn, en = item[1], item[2]
+                # 行末可选的第四个元素：题号列上写死的标签（子问用，如 "19-2"）
+                label = item[3] if len(item) > 3 else None
+                option_index += 1
+                new_stem(pad([("", "module", 1), ("", "body", 1),
+                              (label if label is not None else str(option_index),
+                               "label", 1),
+                              ("", "label", 1), (cn, "body", 1), (en, "body", 1)]))
+            elif row_kind == "scale":
+                # 量表标签是图例，不是选项，不编号，也不作为追问的附着点
+                _, cn, en = item
+                rows.append(pad([("", "module", 1), ("", "body", 1), ("", "body", 1),
+                                 ("", "body", 1), (cn, "scale", 1), (en, "scale", 1)]))
+            else:  # fu / obs
+                column = col_of(row_kind)
+                at = cursor[row_kind]
+                if at is None:
+                    # 先试题干行；那一格已被占则另起一行
+                    at = stem if not rows[stem][column - 1][0].strip() else None
+                    if at is None:
+                        rows.append(blank_row())
+                        at = len(rows) - 1
+                elif rows[at][column - 1][0].strip():
+                    rows.append(blank_row())
+                    at = len(rows) - 1
+                rows[at][column - 1] = (item[1], "body", 1)
+                cursor[row_kind] = at
+
+        first_row = sheet.row + 1
+        for cells in rows:
+            sheet.add(cells)
+        if any(x[0] == "q" for x in block):
+            sheet.mark_block_top(first_row)
+            block_first = first_row
+            close_block()
+        # 非题目块（kv / sub）不合并「目的 / 题型」
+
     close_block()
     if page_first is not None:
         sheet.merge_down(1, page_first, sheet.row)
