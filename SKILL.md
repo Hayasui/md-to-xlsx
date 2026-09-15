@@ -656,6 +656,15 @@ python ../sc-to-en/scripts/lint_usertesting.py <英文版.md> --sc <中文版.md
   校验器的换算系数已按此定标，改列宽时需重新校准
 - 脚本 `import` 校验器时走 `load_validator()`：先同目录，再技能安装目录
   （`~/.workbuddy/skills/md-to-research-xlsx/scripts`）。技能换位置要同步改这一处
+- **想在脚本里自己收校验报告，直接调 `validate_xlsx.check(path)`**：它返回
+  `(workbook, problems)` 两件，不是只返回 problems；problem 是五元组
+  `(level, sheet_name, coord, kind, detail)`，`level` 为 `error` 或 `warning`。
+  预期落空时报的是 `KeyError: 'Worksheet 0 does not exist.'`——那是把 workbook 当成
+  problems 逐项取 `p[0]` 了，改解包即可
+- **本机（Windows）跑脚本要用 venv 的解释器**：
+  `~/.workbuddy/binaries/python/envs/default/Scripts/python.exe`。管理版的
+  `binaries/python/versions/3.13.12/python.exe` 没装 openpyxl，用它跑会抛
+  `ModuleNotFoundError: No module named 'openpyxl'`
 - **别把中文路径当命令行参数传给 python**。本机（Windows）实测偶发：路径
   `C:\Agent\用研工作\...` 被按 GBK 解成乱码，脚本抛 `FileNotFoundError`，而报错信息里的
   路径也是乱的，容易被误判成文件真的不存在（同样的调用换个时机又能跑通，症状不稳定）。
