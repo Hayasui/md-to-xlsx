@@ -102,11 +102,11 @@ _STYLE_SPEC = {
     "module":  (10, True,  "1F3A4D", False, "EEF4F8", "left",   "center"),
     "key":     (10, True,  "1F3A4D", False, "F4F7F9", "left",   "center"),
     "label":   (10, False, "334E5C", False, None,     "center", "center"),
-    "judge":   (10, False, "8A4A2B", False, None,     "left",   "top"),
-    "stop":    (10, True,  "A32D2D", False, None,     "left",   "top"),
-    "scale":   (10, False, "334E5C", False, "F7F9FB", "left",   "top"),
-    "muted":   (10, False, "6B7C88", False, None,     "left",   "top"),
-    "body":    (10, False, "1F2A33", False, None,     "left",   "top"),
+    "judge":   (10, False, "8A4A2B", False, None,     "left",   "center"),
+    "stop":    (10, True,  "A32D2D", False, None,     "left",   "center"),
+    "scale":   (10, False, "334E5C", False, "F7F9FB", "left",   "center"),
+    "muted":   (10, False, "6B7C88", False, None,     "left",   "center"),
+    "body":    (10, False, "1F2A33", False, None,     "left",   "center"),
 }
 
 
@@ -512,6 +512,33 @@ def check_modules(spec):
     raise ValueError("\n".join(lines))
 
 
+def plan_logic_runs(logic_list):
+    """把选项行的逻辑文本按「连续且相同且非空」分组，供「问卷逻辑」列纵合并。
+
+    交付表上每个选项行都要有去向（没有分支的写默认出口「→ 下一题」），
+    去向相同的相邻选项在表里合成一格，读者扫一列就看得出这一段一起去哪。
+    空逻辑不合并——空白格留着，表示这一行没有额外规则。
+
+    返回 (shown, runs)：shown 与入参等长，同组只保留首行的文本，其余置空；
+    runs 是 [(首行序号, 末行序号), ...]（1 起），交给 Sheet.merge_down 用。
+    """
+    logic = ["" if lg is None else str(lg) for lg in logic_list]
+    shown = list(logic)
+    runs = []
+    i, n = 0, len(logic)
+    while i < n:
+        j = i
+        if logic[i]:
+            while j + 1 < n and logic[j + 1] == logic[i]:
+                j += 1
+        if j > i:
+            for k in range(i + 1, j + 1):
+                shown[k] = ""
+            runs.append((i + 1, j + 1))
+        i = j + 1
+    return shown, runs
+
+
 def build_survey(workbook, spec):
     """问卷表（中英并列）：模块 | 题型 | 题号 | 中文 | English | 问卷逻辑。"""
     columns = spec.get("columns", COLUMNS_SURVEY)
@@ -547,10 +574,17 @@ def build_survey(workbook, spec):
             first = sheet.row + 1
             sheet.add([(purpose, "key", 1), (qtype, "label", 1), (qno, "label", 1),
                        (stem_cn, "body", 1), (stem_en, "body", 1), (logic, "judge", 1)])
+            # 「问卷逻辑」列：连续且去向相同的选项在表里合并成一格，只有首行写文本。
+            shown, runs = plan_logic_runs([o[2] if len(o) > 2 else "" for o in options])
+            first_option_row = sheet.row + 1
             for index, (cn, en, mark) in enumerate(options, 1):
+                text = shown[index - 1]
                 sheet.add(blank(2) + [(str(index), "label", 1), (cn, "body", 1),
                                       (en, "body", 1),
-                                      (mark, "stop" if mark else "body", 1)])
+                                      (text, "stop" if text else "body", 1)])
+            for run_first, run_last in runs:
+                sheet.merge_down(6, first_option_row + run_first - 1,
+                                 first_option_row + run_last - 1)
             sheet.merge_down(1, first, sheet.row)
             sheet.merge_down(2, first, sheet.row)
             sheet.mark_block_top(first)
@@ -611,9 +645,16 @@ def build_survey_cn(workbook, spec):
                        (stem, "body", 1), (qlogic, "judge", 1)])
             block_first = sheet.row
             sheet.mark_block_top(sheet.row)
+            # 「问卷逻辑」列：连续且去向相同的选项在表里合并成一格，只有首行写文本。
+            shown, runs = plan_logic_runs([o[1] if len(o) > 1 else "" for o in options])
+            first_option_row = sheet.row + 1
             for index, (option, logic) in enumerate(options, 1):
+                text = shown[index - 1]
                 sheet.add(blank(2) + [(str(index), "label", 1), (option, "body", 1),
-                                      (logic, "stop" if logic else "body", 1)])
+                                      (text, "stop" if text else "body", 1)])
+            for run_first, run_last in runs:
+                sheet.merge_down(5, first_option_row + run_first - 1,
+                                 first_option_row + run_last - 1)
         elif kind == "field":
             if block_first is None:
                 raise ValueError(
